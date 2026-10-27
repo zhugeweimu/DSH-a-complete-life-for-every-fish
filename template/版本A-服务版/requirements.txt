@@ -1,0 +1,5 @@
+# 记忆本体依赖（尽量少）
+# 标准库已覆盖 SQLite / HTTP
+numpy>=1.24
+# 可选：启用 ONNX 重排时需要
+onnxruntime>=1.16 ; extra == "rerank"

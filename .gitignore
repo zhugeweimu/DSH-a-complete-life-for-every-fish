@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.err
+node_modules/
+.venv/
+.DS_Store

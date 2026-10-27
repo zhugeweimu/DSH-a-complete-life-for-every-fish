@@ -1,0 +1,10 @@
+{
+  "MEM_DB": "./data/metadata.db",
+  "MEM_INBOX": "http://127.0.0.1:8001/booku-memory/api/memories",
+  "GRAPH_DIR": "./data/graph",
+  "EMBED_URL": "http://127.0.0.1:8081/v1/embeddings",
+  "RERANK_MODEL": "",
+  "PORT_CORE": 8095,
+  "PORT_RETRIEVAL": 8096,
+  "PORT_GRAPH": 8094
+}

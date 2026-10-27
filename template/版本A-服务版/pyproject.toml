@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-core"
+version = "0.2.0"
+description = "A local, standalone long-term memory core: SQLite + BM25 + optional vectors/rerank + graph."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "memory-core contributors" }]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+rerank = ["onnxruntime>=1.16"]
+
+[project.scripts]
+memory-core = "memory_core:main"
+memory-retrieval = "retrieval_server:main"
+memory-graph = "graph_server:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["memory_core", "hybrid", "reranker_onnx", "retrieval_server", "graph_server"]
