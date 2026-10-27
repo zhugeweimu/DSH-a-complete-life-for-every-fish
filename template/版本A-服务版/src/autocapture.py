@@ -45,12 +45,20 @@ TYPE_TAG = {"fact": "事实", "preference": "偏好", "plan": "计划", "promise
             "relationship": "关系", "event": "事件", "note": "指定记录"}
 
 
+NEG = re.compile(r"[不没别未无]")
+
 def detect(text):
-    """返回命中的类型列表（按 RULES 顺序，去重）"""
+    """返回命中的类型列表；命中词前 4 字有否定词则跳过（不喜欢 这类否定本身除外）"""
     hits = []
+    s = text or ""
     for kind, pat in RULES:
-        if re.search(pat, text or ""):
-            hits.append(kind)
+        m = re.search(pat, s)
+        if not m:
+            continue
+        prefix = s[max(0, m.start() - 4):m.start()]
+        if NEG.search(prefix):
+            continue
+        hits.append(kind)
     return hits
 
 

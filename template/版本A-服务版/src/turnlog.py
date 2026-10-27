@@ -47,7 +47,7 @@ def _db(db=None):
 
 
 def ensure(db=None):
-    con = sqlite3.connect(_db(db))
+    con = sqlite3.connect(_db(db), timeout=10)
     con.executescript(DDL)
     con.commit()
     con.close()
@@ -61,7 +61,7 @@ def _last(con, person):
 
 def close_session(person, session_id, db=None):
     """把一段会话变成一条事件；返回事件 id 或 None"""
-    con = sqlite3.connect(_db(db))
+    con = sqlite3.connect(_db(db), timeout=10)
     con.row_factory = sqlite3.Row
     rows = con.execute(
         "SELECT user_text, ts FROM turn_logs WHERE person=? AND session_id=? AND closed=0 "
@@ -104,7 +104,7 @@ def append(person, user_text, reply_text="", ts=None, db=None):
     """追加一条日志；跨过 30 分钟自动关闭上一段会话并生成事件"""
     ensure(db)
     ts = float(ts or time.time())
-    con = sqlite3.connect(_db(db))
+    con = sqlite3.connect(_db(db), timeout=10)
     con.row_factory = sqlite3.Row
     last = _last(con, person)
     closed = None
@@ -132,7 +132,7 @@ def append(person, user_text, reply_text="", ts=None, db=None):
 
 
 def pending_sessions(db=None):
-    con = sqlite3.connect(_db(db))
+    con = sqlite3.connect(_db(db), timeout=10)
     rows = con.execute("SELECT session_id, person, MIN(ts), COUNT(*) FROM turn_logs "
                        "WHERE closed=0 GROUP BY session_id, person").fetchall()
     con.close()
@@ -144,7 +144,7 @@ def sweep(now=None, db=None):
     now = float(now or time.time())
     out = []
     for s in pending_sessions(db=db):
-        con = sqlite3.connect(_db(db))
+        con = sqlite3.connect(_db(db), timeout=10)
         row = con.execute("SELECT MAX(ts) FROM turn_logs WHERE session_id=? AND person=?",
                           (s["session_id"], s["person"])).fetchone()
         con.close()
@@ -154,6 +154,20 @@ def sweep(now=None, db=None):
             if r:
                 out.append({"session_id": s["session_id"], **r})
     return out
+
+
+def prune_logs(older_days=180, db=None, closed_only=True):
+    """清理旧日志行（只清已结算的）；事件不受影响"""
+    import time as _t
+    cutoff = _t.time() - float(older_days) * 86400
+    con = sqlite3.connect(_db(db), timeout=10)
+    try:
+        q = "DELETE FROM turn_logs WHERE ts < ?" + (" AND closed=1" if closed_only else "")
+        cur = con.execute(q, (cutoff,))
+        con.commit()
+        return {"deleted": cur.rowcount}
+    finally:
+        con.close()
 
 
 def replay(turns, db=None):

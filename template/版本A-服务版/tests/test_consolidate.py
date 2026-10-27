@@ -49,6 +49,12 @@ class TestConsolidate(unittest.TestCase):
         self.assertEqual(st["普通事件"], 1)
         self.assertEqual(st["计划"], 0)
 
+    def test_idle_skip(self):
+        import turnlog as TL
+        TL.append("u", "正在聊天", ts=self.now, db=self.db)
+        r = C.run(db=self.db, now=self.now)
+        self.assertEqual(r.get("skipped"), "active")
+
     def test_recent_not_archived(self):
         S.add("新事件", "今天的事", person="u", importance=0.35,
               memory_type="session:plain", ts=self.now - 86400, db=self.db)

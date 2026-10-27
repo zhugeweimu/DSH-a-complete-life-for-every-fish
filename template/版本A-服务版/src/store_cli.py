@@ -42,6 +42,9 @@ def main():
     b.add_argument("file")
 
     sub.add_parser("sweep", help="关闭空闲超过 30 分钟的会话，生成事件")
+    pl = sub.add_parser("prune-logs", help="清理已结算的旧日志行（不影响事件）")
+    pl.add_argument("--days", type=int, default=180)
+
     cl = sub.add_parser("cleanup", help="夜间巩固：软删除超期的普通事件")
     cl.add_argument("--days", type=int, default=30)
     cl.add_argument("--min-weight", type=float, default=0.35)
@@ -88,6 +91,11 @@ def main():
         r = CX.build(args.person, args.q, args.top, args.max_chars, db=db)
         print(r["text"])
         print(json.dumps(r["items"], ensure_ascii=False))
+        return 0
+
+    if args.cmd == "prune-logs":
+        import turnlog as TL
+        print(json.dumps(TL.prune_logs(args.days, db=db), ensure_ascii=False))
         return 0
 
     if args.cmd == "cleanup":

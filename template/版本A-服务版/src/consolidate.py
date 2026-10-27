@@ -35,11 +35,20 @@ def _decay(ts, last_active, importance, now):
     return max(0.0, min(1.0, w))
 
 
-def run(db=None, now=None, archive_days=30, min_weight=0.35):
+def run(db=None, now=None, archive_days=30, min_weight=0.35, idle_minutes=10):
     now = float(now or time.time())
+    # 正在聊天就跳过，避免和写入抢锁
+    try:
+        con0 = sqlite3.connect(_db(db), timeout=10)
+        row = con0.execute("SELECT MAX(ts) FROM turn_logs").fetchone()
+        con0.close()
+        if row and row[0] and now - float(row[0]) < float(idle_minutes) * 60:
+            return {"skipped": "active", "scanned": 0, "archived": []}
+    except Exception:
+        pass
     docs = H.load_corpus(_db(db))
     archived = []
-    con = sqlite3.connect(_db(db))
+    con = sqlite3.connect(_db(db), timeout=10)
     try:
         for d in docs:
             if (d.get("type") or "") not in PLAIN_TYPES:

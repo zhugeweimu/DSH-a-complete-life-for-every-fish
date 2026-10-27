@@ -50,6 +50,12 @@ class TestDiary(unittest.TestCase):
         self.assertTrue(os.path.isdir(os.path.join(out["out"], "日记")))
         self.assertTrue(os.path.isdir(os.path.join(out["out"], "memories")))
 
+    def test_safe_filename(self):
+        from vault import _safe
+        self.assertEqual(_safe("CON"), "_CON")
+        self.assertNotIn("/", _safe("a/b\\c:d*e?f"))
+        self.assertNotIn("\x00", _safe("a\x00b"))
+
     def test_empty_rejected(self):
         with self.assertRaises(ValueError):
             D.write_diary("  ", db=self.db)

@@ -22,8 +22,13 @@ def _db(db=None):
     return db or os.environ.get("MEM_DB") or os.path.join(HERE, "..", "data", "metadata.db")
 
 
+_RESERVED = {"CON","PRN","AUX","NUL", *( "COM%d" % i for i in range(1,10)), *( "LPT%d" % i for i in range(1,10))}
+
 def _safe(s):
-    s = re.sub(r'[\\/:*?"<>|\s]+', "_", (s or "")[:40]).strip("_")
+    s = re.sub(r"[\x00-\x1f\x7f]", "", s or "")
+    s = re.sub(r'[\\/:*?"<>|\s]+', "_", s)[:40].strip("_. ")
+    if s.upper() in _RESERVED:
+        s = "_" + s
     return s or "untitled"
 
 

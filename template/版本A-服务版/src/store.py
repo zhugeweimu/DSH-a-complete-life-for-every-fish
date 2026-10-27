@@ -67,7 +67,7 @@ def _importance(title, given=None):
 
 def find_duplicate(db, title, content, person="", memory_type=""):
     """返回 (row|None, score, kind)，kind ∈ exact/near/none；不同类型不互相合并"""
-    con = sqlite3.connect(_db(db))
+    con = sqlite3.connect(_db(db), timeout=10)
     con.row_factory = sqlite3.Row
     fp = fingerprint(title, content, person, memory_type)
     row = con.execute(
@@ -117,7 +117,7 @@ def add(title, content, person="", tags=None, importance=None, folder="", memory
     if not title:
         title = content[:20]
     ts = _now(ts)
-    con = sqlite3.connect(_db(db))
+    con = sqlite3.connect(_db(db), timeout=10)
     try:
         dup, score, kind = find_duplicate(db, title, content, person, memory_type)
         if dup:
