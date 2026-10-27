@@ -211,16 +211,20 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
     return {"q": q, "mode": mode, "corpus": len(docs), "results": out}
 
 
-def remember(title, content, person_id="", tags=None, importance=None, ts=None):
+def remember(title, content, person_id="", tags=None, importance=None, ts=None,
+             origin="unknown", author="", source_event="", version=1):
     # 独立模式：不依赖任何平台，直接写本地库
     if os.environ.get("MEM_WRITE_MODE", "auto") == "local":
-        r = ST.add(title, content, person=person_id, tags=tags or [], importance=importance, ts=ts)
+        r = ST.add(title, content, person=person_id, tags=tags or [], importance=importance, ts=ts,
+                   origin=origin, author=author, source_event=source_event, version=version)
         return {"ok": True, "id": r["id"], "merged": r["merged"], "mode": "local"}
     payload = {"title": (title or "无题")[:60], "content": content or "",
                "folder_id": "default", "bucket": "memory", "memory_type": "event",
                "status": "active", "person_id": person_id,
                "core_tags": tags or ["对话"], "diffusion_tags": ["core"],
-               "opposing_tags": ["未分类"]}
+               "opposing_tags": ["未分类"],
+        "origin": d.get("origin", "unknown"), "author": d.get("author", ""),
+        "source_event": d.get("source_event", ""), "version": int(d.get("version") or 1)}
     if ts:
         payload["ts"] = float(ts)
         payload["created_at"] = float(ts)

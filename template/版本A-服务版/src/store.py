@@ -35,6 +35,22 @@ def _now(ts=None):
     return float(ts if ts is not None else time.time())
 
 
+def _ensure_provenance(con):
+    cols = {r[1] for r in con.execute("PRAGMA table_info(booku_memory_records)")}
+    added = False
+    for name, ddl in (("origin", "TEXT NOT NULL DEFAULT 'unknown'"),
+                      ("author", "TEXT NOT NULL DEFAULT ''"),
+                      ("source_event", "TEXT NOT NULL DEFAULT ''"),
+                      ("version", "INTEGER NOT NULL DEFAULT 1")):
+        if name not in cols:
+            con.execute("ALTER TABLE booku_memory_records ADD COLUMN %s %s" % (name, ddl))
+            if name == "origin":
+                added = True
+    if added:
+        con.execute("UPDATE booku_memory_records SET origin='legacy' WHERE origin='unknown'")
+    con.commit()
+
+
 def normalize_title(s):
     s = re.sub(r"\s+", " ", (s or "").strip())
     return s[:80]
@@ -108,7 +124,7 @@ def _merge(con, dup, title, content, tags, ts):
 
 
 def add(title, content, person="", tags=None, importance=None, folder="", memory_type="event",
-        ts=None, db=None):
+        ts=None, db=None, origin="unknown", author="", source_event="", version=1):
     """写入一条；返回 {"id","merged","dup_id","score"}"""
     title = normalize_title(title)
     content = (content or "").strip()
@@ -119,6 +135,7 @@ def add(title, content, person="", tags=None, importance=None, folder="", memory
     ts = _now(ts)
     con = sqlite3.connect(_db(db), timeout=10)
     try:
+        _ensure_provenance(con)
         dup, score, kind = find_duplicate(db, title, content, person, memory_type)
         if dup:
             _merge(con, dup, title, content, tags, ts)
@@ -129,9 +146,11 @@ def add(title, content, person="", tags=None, importance=None, folder="", memory
         imp = _importance(title, importance)
         con.execute(
             "INSERT INTO booku_memory_records (memory_id,title,content,person_id,folder_id,"
-            "memory_type,importance,created_at,updated_at,last_activated_at,activation_count,is_deleted)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,0,0)",
-            (mid, title, content, person or "", folder or "", memory_type, imp, ts, ts, ts))
+            "memory_type,importance,created_at,updated_at,last_activated_at,activation_count,is_deleted,"
+            "origin,author,source_event,version)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)",
+            (mid, title, content, person or "", folder or "", memory_type, imp, ts, ts, ts,
+             origin or "unknown", author or "", source_event or "", int(version or 1)))
         for t in tags or []:
             con.execute("INSERT INTO booku_memory_tags (memory_id,tag_type,tag_value) VALUES (?,?,?)",
                         (mid, "core", t))
@@ -146,7 +165,9 @@ def add_batch(items, db=None):
                 person=item.get("person", item.get("person_id", "")),
                 tags=item.get("tags") or [], importance=item.get("importance"),
                 folder=item.get("folder", ""), memory_type=item.get("memory_type", "event"),
-                ts=item.get("ts"), db=db) for item in items]
+                ts=item.get("ts"), db=db,
+        origin=item.get("origin", "unknown"), author=item.get("author", ""),
+        source_event=item.get("source_event", ""), version=item.get("version", 1)) for item in items]
 
 
 def ingest_jsonl(path, db=None):

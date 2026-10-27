@@ -13,7 +13,11 @@ CREATE TABLE IF NOT EXISTS booku_memory_records (
     updated_at         REAL NOT NULL DEFAULT 0,
     last_activated_at  REAL NOT NULL DEFAULT 0,
     activation_count   INTEGER NOT NULL DEFAULT 0,
-    is_deleted         INTEGER NOT NULL DEFAULT 0
+    is_deleted         INTEGER NOT NULL DEFAULT 0,
+    origin             TEXT NOT NULL DEFAULT 'unknown',
+    author             TEXT NOT NULL DEFAULT '',
+    source_event       TEXT NOT NULL DEFAULT '',
+    version            INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_mem_person     ON booku_memory_records (person_id);
