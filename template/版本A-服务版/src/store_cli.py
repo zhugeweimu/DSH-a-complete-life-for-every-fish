@@ -42,6 +42,9 @@ def main():
     b.add_argument("file")
 
     sub.add_parser("sweep", help="关闭空闲超过 30 分钟的会话，生成事件")
+    cl = sub.add_parser("cleanup", help="夜间巩固：软删除超期的普通事件")
+    cl.add_argument("--days", type=int, default=30)
+    cl.add_argument("--min-weight", type=float, default=0.35)
 
     cx = sub.add_parser("context", help="生成可注入的上下文（不自动注入）")
     cx.add_argument("--q", default="")
@@ -85,6 +88,12 @@ def main():
         r = CX.build(args.person, args.q, args.top, args.max_chars, db=db)
         print(r["text"])
         print(json.dumps(r["items"], ensure_ascii=False))
+        return 0
+
+    if args.cmd == "cleanup":
+        import consolidate as CO
+        print(json.dumps(CO.run(db=db, archive_days=args.days,
+                                min_weight=args.min_weight), ensure_ascii=False))
         return 0
 
     if args.cmd == "sweep":

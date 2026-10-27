@@ -62,6 +62,14 @@ class TestTurnLog(unittest.TestCase):
         self.assertEqual(ev[0][0], "session:plain")
         self.assertAlmostEqual(ev[0][1], TL.PLAIN_IMPORTANCE, places=3)
 
+    def test_max_session_cap(self):
+        base = 1000
+        r = None
+        for dt, txt in ((0, "a"), (1700, "b"), (3400, "c"), (5100, "d"), (6800, "e"), (7300, "f")):
+            r = TL.append("user:A", txt, ts=base + dt, db=self.db)
+        self.assertIsNotNone(r["closed"])
+        self.assertEqual(len(self.events()), 1)
+
     def test_pending_sessions(self):
         TL.append("user:A", "你好呀", ts=1000, db=self.db)
         p = TL.pending_sessions(db=self.db)

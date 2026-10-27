@@ -40,6 +40,7 @@ import hybrid as H                      # noqa: E402
 import reranker_onnx as R               # noqa: E402
 import graph_server as G                # noqa: E402
 import store as ST
+import consolidate as CO
 
 MEM_DB = os.environ.get("MEM_DB") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "metadata.db")
 MEM_INBOX = os.environ.get("MEM_INBOX", "http://127.0.0.1:8001/booku-memory/api/memories")
@@ -443,6 +444,10 @@ class H2(BaseHTTPRequestHandler):
                                               d.get("person") or "", d.get("scope") or "all",
                                               d.get("rerank") or "bge",
                                               since=d.get("since"), until=d.get("until")))
+            if self.path.startswith("/consolidate"):
+                return self._send(200, CO.run(db=MEM_DB,
+                                             archive_days=int(d.get("archive_days") or 30),
+                                             min_weight=float(d.get("min_weight") or 0.35)))
             if self.path.startswith("/sweep"):
                 import turnlog as TL
                 return self._send(200, {"closed": TL.sweep(db=MEM_DB)})

@@ -23,6 +23,7 @@ import autocapture as AC  # noqa: E402
 import store as S  # noqa: E402
 
 GAP = float(os.environ.get("SESSION_GAP_SEC", "1800"))
+MAX_SESSION_SEC = float(os.environ.get("SESSION_MAX_SEC", "7200"))
 PLAIN_IMPORTANCE = float(os.environ.get("SESSION_PLAIN_IMPORTANCE", "0.35"))
 
 DDL = """
@@ -111,7 +112,16 @@ def append(person, user_text, reply_text="", ts=None, db=None):
         closed = close_session(person, last["session_id"], db=db)
         session_id = "s%d" % int(ts)
     elif last:
-        session_id = last["session_id"]
+        same = last["session_id"]
+        try:
+            start = float(str(same)[1:])
+        except Exception:
+            start = 0.0
+        if start and ts - start > MAX_SESSION_SEC:
+            closed = close_session(person, same, db=db)
+            session_id = "s%d" % int(ts)
+        else:
+            session_id = same
     else:
         session_id = "s%d" % int(ts)
     con.execute("INSERT INTO turn_logs (person,ts,user_text,reply_text,session_id) VALUES (?,?,?,?,?)",

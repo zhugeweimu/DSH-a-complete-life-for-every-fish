@@ -59,6 +59,7 @@ def load_corpus(db_path):
             "ts": r["created_at"] or 0,
             "last_activated": r["last_activated"] or 0,
             "importance": r["importance"],
+            "type": r["memory_type"] or "",
             "tags": tags.get(r["memory_id"], []),
         })
     return docs
