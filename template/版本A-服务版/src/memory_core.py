@@ -48,11 +48,32 @@ _lock = threading.Lock()
 _idx = {}
 
 
+def _db_sig():
+    try:
+        mt = 0.0
+        for p in (MEM_DB, MEM_DB + "-wal"):
+            try:
+                mt = max(mt, os.path.getmtime(p))
+            except OSError:
+                pass
+        n = 0
+        con = sqlite3.connect(MEM_DB, timeout=5)
+        try:
+            n = con.execute("SELECT COUNT(*) FROM booku_memory_records WHERE is_deleted=0").fetchone()[0]
+        finally:
+            con.close()
+        return (mt, n)
+    except Exception:
+        return (0.0, -1)
+
+
 def _index():
     with _lock:
-        if not _idx:
+        sig = _db_sig()
+        if not _idx or _idx.get("sig") != sig:
             _idx["docs"] = H.load_corpus(MEM_DB)
             _idx["bm"] = H.BM25(_idx["docs"])
+            _idx["sig"] = sig
         return _idx
 
 
@@ -148,8 +169,16 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
             _bump(x["id"])
         return {"q": q, "mode": "time-window", "corpus": len(docs), "results": out}
     lex = bm.search(q, top=50)
-    dense = H.dense_search(docs, q, top=50, cache_path=os.environ.get("HYBRID_CACHE", ""))
+    try:
+        dense = H.dense_search(docs, q, top=50, cache_path=os.environ.get("HYBRID_CACHE", ""))
+    except Exception as e:
+        dense = []
+        degraded = "（向量服务不可用，仅 BM25：%r）" % (e,)
+    else:
+        degraded = ""
     fused = H.rrf([x for x in (lex, dense) if x])
+    if degraded and not fused:
+        fused = lex
     if rerank == "bge":
         try:
             picked = R.rerank(q, docs, fused, top)
@@ -182,16 +211,19 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
     return {"q": q, "mode": mode, "corpus": len(docs), "results": out}
 
 
-def remember(title, content, person_id="", tags=None, importance=None):
+def remember(title, content, person_id="", tags=None, importance=None, ts=None):
     # 独立模式：不依赖任何平台，直接写本地库
     if os.environ.get("MEM_WRITE_MODE", "auto") == "local":
-        r = ST.add(title, content, person=person_id, tags=tags or [], importance=importance)
+        r = ST.add(title, content, person=person_id, tags=tags or [], importance=importance, ts=ts)
         return {"ok": True, "id": r["id"], "merged": r["merged"], "mode": "local"}
     payload = {"title": (title or "无题")[:60], "content": content or "",
                "folder_id": "default", "bucket": "memory", "memory_type": "event",
                "status": "active", "person_id": person_id,
                "core_tags": tags or ["对话"], "diffusion_tags": ["core"],
                "opposing_tags": ["未分类"]}
+    if ts:
+        payload["ts"] = float(ts)
+        payload["created_at"] = float(ts)
     req = urllib.request.Request(MEM_INBOX, data=json.dumps(payload, ensure_ascii=False).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r:

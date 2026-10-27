@@ -37,6 +37,7 @@ def init_db(path):
 
 
 def spawn(script, port, cwd=HERE):
+    port = int(port)
     cmd = [PY, "-X", "utf8", os.path.join(SRC, script), str(port)]
     print("[run] %s :%d" % (script, port))
     return subprocess.Popen(cmd, cwd=cwd)
