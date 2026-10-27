@@ -13,8 +13,8 @@
 export const name = 'dsh-memory-core'
 export const VERSION = '0.1.0'
 
-// 只依赖工具注册；不需要 sessionController / webServer
-export const inject = ['tools']
+// 工具 + 会话服务（agent/created 用于挂 systemPrompt 段）
+export const inject = ['tools', 'sessionController']
 
 const DEFAULT_BASE = 'http://127.0.0.1:8095'
 
@@ -69,9 +69,52 @@ const outSchema = {
 
 const render = (_a, out) => [{ type: 'text', text: out.text }]
 
+const injectCache = { text: '' }
+
+async function refreshBundle(base, config) {
+  try {
+    const r = await post(base, '/context', {
+      q: '',
+      include_self: true,
+      diary_days: Number(config.diaryDays || 0),
+      min_score: Number(config.memoryMinScore ?? 0.5),
+      max_chars: Number(config.injectMaxChars || 1600),
+    })
+    if (r && typeof r.text === 'string') injectCache.text = r.text
+  } catch { /* 内核不可达就保持上一版 */ }
+}
+
+function wantAgent(agent, config) {
+  if (config.autoInject === false) return false
+  const cwd = String(agent?.session?.header?.cwd || agent?.header?.cwd || '')
+  const want = String(config.injectCwd || '')
+  return !want || cwd.toLowerCase().includes(want.toLowerCase())
+}
+
 export function apply(ctx, config = {}) {
   const base = baseOf(config)
   const disposers = []
+  let timer = null
+
+  // 自动注入：每 30 秒刷新一次注入包；text() 同步返缓存
+  if (config.autoInject !== false) {
+    refreshBundle(base, config)
+    timer = setInterval(() => refreshBundle(base, config), 30000)
+    if (timer.unref) timer.unref()
+    const offAgent = ctx.on?.('agent/created', ({ agent } = {}) => {
+      if (!wantAgent(agent, config)) return
+      try {
+        agent?.ctx?.systemPrompt?.section({
+          name: 'memory:inject',
+          order: 8400,
+          text: () => injectCache.text,
+        })
+      } catch (e) {
+        console.warn('[dsh-memory-core] 注入段没挂上', e?.message || e)
+      }
+    })
+    if (typeof offAgent === 'function') disposers.push(offAgent)
+  }
 
   const tools = [
     {
@@ -192,69 +235,6 @@ export function apply(ctx, config = {}) {
       },
     },
     {
-      name: 'memory_diary',
-      description: '写一条日记。同时进记忆库和可看的日记文件夹。',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: '今天发生了什么/想了什么' },
-          day: { type: 'string', description: '日期 YYYY-MM-DD（可选，默认今天）' },
-          person: { type: 'string', description: '谁（可选）' },
-        },
-        required: ['text'],
-      },
-      output: { schema: outSchema, render },
-      async execute(args = {}) {
-        try {
-          const data = await post(base, '/diary', {
-            text: args.text || '', day: args.day || undefined, person: personOf(config, args),
-          })
-          return { ok: true, text: '日记已写。' }
-        } catch (e) {
-          return { ok: false, text: failText(e) }
-        }
-      },
-    },
-    {
-      name: 'memory_self',
-      description: '追加一段自述（我是谁/我怎么想）。只追加，不覆盖。',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: '自述内容' },
-          day: { type: 'string', description: '日期（可选）' },
-        },
-        required: ['text'],
-      },
-      output: { schema: outSchema, render },
-      async execute(args = {}) {
-        try {
-          await post(base, '/self', { text: args.text || '', day: args.day || undefined, person: personOf(config, args) })
-          return { ok: true, text: '自述已追加。' }
-        } catch (e) {
-          return { ok: false, text: failText(e) }
-        }
-      },
-    },
-    {
-      name: 'memory_export',
-      description: '把记忆导出成可直接翻看的文件夹（index.md + 每天一个目录 + 日记/自述）。',
-      parameters: {
-        type: 'object',
-        properties: { out: { type: 'string', description: '输出目录（可选，默认记忆库旁的 vault/）' } },
-        required: [],
-      },
-      output: { schema: outSchema, render },
-      async execute(args = {}) {
-        try {
-          const data = await post(base, '/export', { out: args.out || undefined })
-          return { ok: true, text: '已导出到 ' + (data.out || 'vault/') }
-        } catch (e) {
-          return { ok: false, text: failText(e) }
-        }
-      },
-    },
-    {
       name: 'memory_sweep',
       description: '结算所有空闲超过 30 分钟的会话（把最后一段对话落成事件）。',
       parameters: { type: 'object', properties: {}, required: [] },
@@ -287,6 +267,7 @@ export function apply(ctx, config = {}) {
   }
 
   const dispose = () => {
+    if (timer) clearInterval(timer)
     for (const d of disposers) {
       try { d() } catch { /* ignore */ }
     }

@@ -40,8 +40,6 @@ import hybrid as H                      # noqa: E402
 import reranker_onnx as R               # noqa: E402
 import graph_server as G                # noqa: E402
 import store as ST
-import diary as D
-import vault as V
 
 MEM_DB = os.environ.get("MEM_DB") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "metadata.db")
 MEM_INBOX = os.environ.get("MEM_INBOX", "http://127.0.0.1:8001/booku-memory/api/memories")
@@ -445,26 +443,17 @@ class H2(BaseHTTPRequestHandler):
                                               d.get("person") or "", d.get("scope") or "all",
                                               d.get("rerank") or "bge",
                                               since=d.get("since"), until=d.get("until")))
-            if self.path.startswith("/diary"):
-                r = D.write_diary(d.get("text") or "", d.get("day"), d.get("person") or "", db=MEM_DB, ts=d.get("ts"))
-                try: V.export(db=MEM_DB)
-                except Exception: pass
-                return self._send(200, r)
-            if self.path.startswith("/self"):
-                r = D.write_self(d.get("text") or "", d.get("day"), d.get("person") or "", db=MEM_DB, ts=d.get("ts"))
-                try: V.export(db=MEM_DB)
-                except Exception: pass
-                return self._send(200, r)
-            if self.path.startswith("/export"):
-                return self._send(200, V.export(db=MEM_DB, out=d.get("out")))
             if self.path.startswith("/sweep"):
                 import turnlog as TL
                 return self._send(200, {"closed": TL.sweep(db=MEM_DB)})
             if self.path.startswith("/context"):
                 import context as CX
-                return self._send(200, CX.build(d.get("person") or "", d.get("q") or "",
-                                                int(d.get("top") or 5),
-                                                int(d.get("max_chars") or 1200), db=MEM_DB))
+                return self._send(200, CX.build(
+                    d.get("person") or "", d.get("q") or "",
+                    int(d.get("top") or 5), int(d.get("max_chars") or 1200), db=MEM_DB,
+                    include_self=bool(d.get("include_self")),
+                    diary_days=int(d.get("diary_days") or 0),
+                    min_score=float(d.get("min_score") or 0)))
             if self.path.startswith("/log"):
                 import turnlog as TL
                 r = TL.append(d.get("person") or "", d.get("user") or "", d.get("reply") or "",
@@ -532,10 +521,6 @@ def main():
     arg = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].isdigit() else ""
     port = int(arg or os.environ.get("CORE_PORT") or 8095)
     _cleanup_flow()
-    try:
-        V.export(db=MEM_DB)
-    except Exception as e:
-        print("vault 导出失败:", repr(e), flush=True)
     print("记忆内核 http://127.0.0.1:%d  mem_db=%s  graph_db=%s" % (port, MEM_DB, G.DB_PATH))
     ThreadingHTTPServer(("127.0.0.1", port), H2).serve_forever()
 

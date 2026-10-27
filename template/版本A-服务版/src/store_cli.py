@@ -43,19 +43,6 @@ def main():
 
     sub.add_parser("sweep", help="关闭空闲超过 30 分钟的会话，生成事件")
 
-    dg = sub.add_parser("diary", help="写一条日记（追加到日记文件 + 记忆库）")
-    dg.add_argument("--text", required=True)
-    dg.add_argument("--day", default=None)
-    dg.add_argument("--person", default="")
-
-    sf = sub.add_parser("self", help="追加一段自述")
-    sf.add_argument("--text", required=True)
-    sf.add_argument("--day", default=None)
-    sf.add_argument("--person", default="")
-
-    ex = sub.add_parser("export", help="把记忆导出成可看的文件夹")
-    ex.add_argument("--out", default=None)
-
     cx = sub.add_parser("context", help="生成可注入的上下文（不自动注入）")
     cx.add_argument("--q", default="")
     cx.add_argument("--person", default="")
@@ -98,21 +85,6 @@ def main():
         r = CX.build(args.person, args.q, args.top, args.max_chars, db=db)
         print(r["text"])
         print(json.dumps(r["items"], ensure_ascii=False))
-        return 0
-
-    if args.cmd == "diary":
-        import diary as D
-        print(json.dumps(D.write_diary(args.text, args.day, args.person, db=db), ensure_ascii=False))
-        return 0
-
-    if args.cmd == "self":
-        import diary as D
-        print(json.dumps(D.write_self(args.text, args.day, args.person, db=db), ensure_ascii=False))
-        return 0
-
-    if args.cmd == "export":
-        import vault as V
-        print(json.dumps(V.export(db=db, out=args.out), ensure_ascii=False))
         return 0
 
     if args.cmd == "sweep":

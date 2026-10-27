@@ -2,7 +2,7 @@
 
 把本地 **memory-core** 接进 DSH 的插件。它只做一件事：**注册记忆工具**，让 DSH 里的会话（包括接进 QQ 的会话）能主动翻记忆、写记忆、生成上下文。
 
-**不自动注入上下文**——会话框、QQ 插件、桥要不要用，由它们自己调。
+默认**自动注入**“自述 + 被唤醒的记忆”（日记可选），也可在配置里关掉；注入走 system prompt，不进对话历史。
 
 ## 两种版本的关系
 
@@ -68,8 +68,8 @@ node examples/integration.mjs     # 对运行中的 8095 做真实 recall + cont
 ## 边界（写清楚，避免误用）
 
 ```
-不自动注入：只注册工具，不碰 system prompt / 对话历史
 不复制数据：所有数据在 memory-core 的 SQLite
-不替宿主决定：QQ 桥/会话框自己决定何时调
-写入模式：memory-core 侧 MEM_WRITE_MODE=auto 时转发 8001；独立部署设 local
+可关：autoInject=false 退回纯工具模式
+日记：diaryDays 默认 0（不注入），设 3 才带近三天
+写入模式：MEM_WRITE_MODE=auto 时转发 8001；独立部署设 local
 ```
