@@ -3,23 +3,27 @@
 > 目标：用户不需要说“记住”，正常说话就会留下该留的记忆。
 > 显式“记住”仍然支持，但不再是唯一入口。
 
-## 两层：日志 + 事件
+## 三层：日志 + 事件 + 语义记忆
 
-`
-日志层（turn_logs）   每回合原样追加，不过滤、不判断 —— 事实
-事件层（records）     会话关闭后生成 —— 记忆，可被召回
-`
+```
+日志层（turn_logs）       每回合原样追加，不过滤、不判断；不向量化
+事件层（event_records）   会话关闭后按类型生成；独立检索
+语义记忆（records）       事实 / 偏好 / 承诺 / 知识；长期保留
+```
+
+事件层不是把日志塞进向量库。日志只事实，事件才可召回；普通事件衰减后归档，日志仍在。
 
 ### 会话分段
 
-`
+```
 同一个人，相邻两回合间隔 > SESSION_GAP_SEC（默认 1800 秒 = 30 分钟）
-→ 上一段关闭，生成一条“会话事件”
-→ 命中七类：重要度取最高类（0.55–0.80）
-→ 没命中：普通事件（默认 0.35）
-`
+→ 上一段关闭
+→ 会话内按类型分桶，每种类型生成一条 event_records
+→ 命中七类：0.55–0.80
+→ 没命中：plain，普通事件（默认 0.35）
+```
 
-日志行本身永不删除；事件可以被遗忘曲线降权。
+日志行本身永不删除；普通事件只从检索层归档，不删 `turn_logs`，也不删 `event_legacy`。
 
 ### 最长会话 2 小时
 
@@ -41,43 +45,38 @@ sweep() 也只查 MAX(ts)，没有定时器、没有轮询时钟
 
 `
 同一段会话里出现 preference + plan + relationship
-→ 拆成 3 条事件，各带各的重要度（0.7 / 0.7 / 0.8）
-→ memory_type 分别为 session:preference / session:plan / session:relationship
-→ store 判重按类型隔离，不会把不同类型合成一条
+→ 拆成 3 条 event_records，各带各的重要度（0.7 / 0.7 / 0.8）
+→ event_type 分别为 preference / plan / relationship
+→ 每条独立 event_id，source_log_ids 记录来源日志
+→ 不用逗号串当事件主键
 `
 
 ### 权重曲线（事件是“可触发的记忆”）
 
-`
-H     = 7 + 365 * imp²        # 半衰期天数
-floor = 0.3 * imp             # 永不归零
-w(d)  = floor + (1-floor) * 2^(-d/H)
-召回分 = 相关度 × (0.4 + 0.6 * w)     # 原始排序分，可 >1
-展示分 = 本批内归一化（0–1）          # 只用于显示
-`
+```
+weight = importance × 0.5^(年龄天数 / 30)
+plain 且 weight < 0.08 → is_archived = 1
+importance 高的非普通事件不因年龄自动归档
+```
 
-实测：
-
-`
-imp=0.70  7d=0.98  30d=0.92  90d=0.77  365d=0.41
-imp=0.35  7d=0.92  30d=0.70  90d=0.37  365d=0.11
-`
+`/decay` 只更新 `event_records.weight`，只归档普通事件。  
+`turn_logs` 与 `event_legacy` 永远不动，需要时可从日志重建事件。
 
 ## 一轮对话怎么处理
 
 ```
 用户消息
   │
-  ├─ 1. 跳过判断：寒暄 / 过短 / 纯问句 → 不记
+  ├─ 1. 只写 turn_logs：原文、时间、session_id
   │
-  ├─ 2. 规则命中（7 类）：fact / preference / plan /
-  │      promise / relationship / event / note
+  ├─ 2. 不按单轮写事件，不按单轮写向量
   │
-  ├─ 3. 同句收敛：note 单独保留；relationship+event 只留 relationship
+  ├─ 3. 会话关闭（30 分钟空闲 / 2 小时上限 / sweep）
   │
-  ├─ 4. 写入：重要度、标签（类型 + 时间词）、时间戳
+  ├─ 4. 按类型分桶，生成 event_records
+  │      每条带 event_id、start_ts/end_ts、source_log_ids
   │
-  └─ 5. 去重：精确指纹 + 近重 Jaccard>0.8 → 合并（激活+1）
+  └─ 5. 普通事件按权重衰减，归档 event_records，日志保留
 ```
 
 ## 七类事件与触发

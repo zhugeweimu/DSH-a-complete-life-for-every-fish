@@ -47,7 +47,6 @@ def load_corpus(db_path):
             tags.setdefault(r["memory_id"], []).append(r["tag_value"])
     except Exception:
         pass
-    con.close()
     docs = []
     for r in rows:
         docs.append({
@@ -62,6 +61,27 @@ def load_corpus(db_path):
             "type": r["memory_type"] or "",
             "tags": tags.get(r["memory_id"], []),
         })
+    try:
+        for r in con.execute(
+            "SELECT id, person, start_ts, summary, event_type, importance, weight, legacy "
+            "FROM event_records WHERE is_archived=0"
+        ):
+            summary = r["summary"] or ""
+            docs.append({
+                "id": r["id"],
+                "title": summary[:60],
+                "text": summary,
+                "folder": "事件",
+                "person": r["person"] or "",
+                "ts": r["start_ts"] or 0,
+                "last_activated": 0,
+                "importance": float(r["importance"] or r["weight"] or 0.5),
+                "type": r["event_type"] or "event",
+                "tags": ["事件", "旧记录" if r["legacy"] else "会话"],
+            })
+    except Exception:
+        pass
+    con.close()
     return docs
 
 

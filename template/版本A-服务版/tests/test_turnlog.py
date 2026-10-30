@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""日志分层：每回合日志 + 30 分钟会话分段 + 会话事件"""
+"""日志分层：每回合日志 + 30 分钟会话分段 + event_records 事件"""
 import os
 import sqlite3
 import sys
@@ -31,7 +31,10 @@ class TestTurnLog(unittest.TestCase):
 
     def events(self):
         con = sqlite3.connect(self.db)
-        rows = con.execute("SELECT memory_type,importance,title FROM booku_memory_records").fetchall()
+        rows = con.execute(
+            "SELECT event_type, importance, source_log_ids FROM event_records "
+            "WHERE is_archived=0 ORDER BY start_ts, id"
+        ).fetchall()
         con.close()
         return rows
 
@@ -50,8 +53,9 @@ class TestTurnLog(unittest.TestCase):
         self.assertEqual(len(r["closed"]["event_ids"]), 2)
         ev = self.events()
         self.assertEqual(len(ev), 2)
-        self.assertEqual({e[0] for e in ev}, {"session:preference", "session:plan"})
+        self.assertEqual({e[0] for e in ev}, {"preference", "plan"})
         self.assertTrue(all(e[1] >= 0.7 for e in ev))
+        self.assertTrue(all(e[2] for e in ev))
 
     def test_plain_session_low_importance(self):
         TL.append("user:A", "今天天气不错", ts=1000, db=self.db)
@@ -59,7 +63,7 @@ class TestTurnLog(unittest.TestCase):
         self.assertIsNotNone(r["closed"])
         ev = self.events()
         self.assertEqual(len(ev), 1)
-        self.assertEqual(ev[0][0], "session:plain")
+        self.assertEqual(ev[0][0], "plain")
         self.assertAlmostEqual(ev[0][1], TL.PLAIN_IMPORTANCE, places=3)
 
     def test_max_session_cap(self):

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 import autocapture as AC  # noqa: E402
@@ -39,6 +40,11 @@ CREATE TABLE IF NOT EXISTS turn_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_log_person_ts ON turn_logs (person, ts);
 CREATE INDEX IF NOT EXISTS idx_log_session  ON turn_logs (session_id);
+CREATE TABLE IF NOT EXISTS event_records (
+    id TEXT PRIMARY KEY, person TEXT, start_ts REAL, end_ts REAL,
+    summary TEXT, event_type TEXT, importance REAL, weight REAL,
+    source_log_ids TEXT, legacy INTEGER DEFAULT 0, is_archived INTEGER DEFAULT 0
+);
 """
 
 
@@ -64,33 +70,47 @@ def close_session(person, session_id, db=None):
     con = sqlite3.connect(_db(db), timeout=10)
     con.row_factory = sqlite3.Row
     rows = con.execute(
-        "SELECT user_text, ts FROM turn_logs WHERE person=? AND session_id=? AND closed=0 "
+        "SELECT id, user_text, reply_text, ts FROM turn_logs WHERE person=? AND session_id=? AND closed=0 "
         "ORDER BY ts, id", (person, session_id)).fetchall()
     if not rows:
         con.close()
         return None
-    texts = [r["user_text"] for r in rows if (r["user_text"] or "").strip()]
+    pairs = [(r["id"], r["user_text"] or "", r["reply_text"] or "") for r in rows
+             if (r["user_text"] or "").strip()]
     # 同一段里不同类型各自成事件，避免高权重事件互相吞并
     groups = {}
-    for t in texts:
-        ks = AC.detect(t) or ["plain"]
+    for log_id, user_text, reply_text in pairs:
+        ks = AC.detect(user_text) or ["plain"]
         if "note" in ks:
             ks = ["note"]
         elif "relationship" in ks and "event" in ks:
             ks = [k for k in ks if k != "event"] or ["event"]
         for k in ks:
-            groups.setdefault(k, []).append(t)
+            groups.setdefault(k, []).append((log_id, user_text, reply_text))
     if not groups:
-        groups = {"plain": ["（空会话）"]}
+        groups = {"plain": [(0, "（空会话）", "")]}
     event_ids, imps = [], []
     for k in sorted(groups):
         imp = AC.TYPE_IMPORTANCE.get(k, PLAIN_IMPORTANCE)
-        tag = AC.TYPE_TAG.get(k, "普通")
-        content = " / ".join(groups[k])[:800]
-        title = "会话·%s·%s" % (time.strftime("%m-%d %H:%M", time.localtime(rows[0]["ts"])), tag)
-        r = S.add(title, content, person=person, tags=["会话", tag], importance=imp,
-                  memory_type="session:" + k, ts=rows[0]["ts"], db=db)
-        event_ids.append(r["id"])
+        parts = []
+        source_ids = []
+        for log_id, user_text, reply_text in groups[k]:
+            if log_id:
+                source_ids.append(str(log_id))
+            if reply_text.strip():
+                parts.append("主人说：%s\n我说：%s" % (user_text, reply_text[:1000]))
+            else:
+                parts.append("主人说：%s" % user_text)
+        content = " / ".join(parts)[:2000]
+        eid = "ev-" + uuid.uuid4().hex
+        con.execute(
+            "INSERT OR REPLACE INTO event_records"
+            "(id,person,start_ts,end_ts,summary,event_type,importance,weight,source_log_ids,legacy,is_archived) "
+            "VALUES(?,?,?,?,?,?,?,?,?,0,0)",
+            (eid, person, rows[0]["ts"], rows[-1]["ts"], content, k, imp, imp,
+             ",".join(source_ids))
+        )
+        event_ids.append(eid)
         imps.append(imp)
     con.execute("UPDATE turn_logs SET closed=1, event_id=? WHERE person=? AND session_id=?",
                 (",".join(event_ids), person, session_id))

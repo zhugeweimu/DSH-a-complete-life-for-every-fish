@@ -487,6 +487,9 @@ class H2(BaseHTTPRequestHandler):
             if self.path.startswith("/sweep"):
                 import turnlog as TL
                 return self._send(200, {"closed": TL.sweep(db=MEM_DB)})
+            if self.path.startswith("/decay"):
+                import decay as DE
+                return self._send(200, DE.run(db=MEM_DB))
             if self.path.startswith("/context"):
                 import context as CX
                 return self._send(200, CX.build(

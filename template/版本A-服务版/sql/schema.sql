@@ -62,3 +62,20 @@ CREATE TABLE IF NOT EXISTS turn_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_log_person_ts ON turn_logs (person, ts);
 CREATE INDEX IF NOT EXISTS idx_log_session  ON turn_logs (session_id);
+
+-- 事件层：日志关闭后按类型合并，独立于原始日志
+CREATE TABLE IF NOT EXISTS event_records (
+    id             TEXT PRIMARY KEY,
+    person         TEXT,
+    start_ts       REAL,
+    end_ts         REAL,
+    summary        TEXT,
+    event_type     TEXT,
+    importance     REAL,
+    weight         REAL,
+    source_log_ids TEXT,
+    legacy         INTEGER NOT NULL DEFAULT 0,
+    is_archived    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_event_person ON event_records (person, start_ts);
+CREATE INDEX IF NOT EXISTS idx_event_active ON event_records (is_archived);
