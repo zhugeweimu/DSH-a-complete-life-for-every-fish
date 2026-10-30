@@ -36,6 +36,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     con = sqlite3.connect(args.db, timeout=30)
     con.row_factory = sqlite3.Row
