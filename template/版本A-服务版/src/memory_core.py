@@ -6,13 +6,13 @@
   · 关系图谱（实体 / 关系边 / 事件向量）      —— 原 8094
   · 人物档案（印象 / 态度 / 特征）            —— 原来是插件里的逻辑
 
-它只读记忆库（sqlite），写入仍走记忆服务 8001（避免双写打架），
-所有调用方只认这一个地址。
+默认直接读写本地 sqlite（MEM_WRITE_MODE=local），不依赖 8001/Neo-MoFox；
+旧库 schema 兼容读取，所有调用方只认 8095 这一个地址。
 
 接口：
   GET  /health
   POST /recall      {q, top, person, scope, rerank}
-  POST /remember    {title, content, person_id, tags}      → 转 8001
+  POST /remember    {title, content, person_id, tags}      → 本地 SQLite
   POST /relation    {subject, predicate, object, note, evidence}
   POST /why         {subject, q}
   GET  /relations?entity=
@@ -43,7 +43,7 @@ import store as ST
 import consolidate as CO
 
 MEM_DB = os.environ.get("MEM_DB") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "metadata.db")
-MEM_INBOX = os.environ.get("MEM_INBOX", "http://127.0.0.1:8001/booku-memory/api/memories")
+MEM_INBOX = os.environ.get("MEM_INBOX", "")
 _lock = threading.Lock()
 _idx = {}
 
@@ -77,7 +77,42 @@ def _index():
         return _idx
 
 
+
+def _local_items(person_id="", limit=200, offset=0):
+    con = sqlite3.connect(MEM_DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    sql = ("SELECT memory_id, title, content, person_id, created_at, updated_at, importance "
+           "FROM booku_memory_records WHERE COALESCE(is_deleted,0)=0")
+    args = []
+    if person_id:
+        sql += " AND person_id=?"
+        args.append(person_id)
+    sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    args += [int(limit), int(offset)]
+    rows = con.execute(sql, args).fetchall()
+    con.close()
+    return {"items": [{
+        "id": r["memory_id"],
+        "title": r["title"] or "",
+        "content_snippet": (r["content"] or "")[:240],
+        "metadata": {
+            "created_at": r["created_at"] or 0,
+            "updated_at": r["updated_at"] or 0,
+            "importance": r["importance"] or 0,
+            "person_id": r["person_id"] or "",
+            "core_tags": [],
+        },
+    } for r in rows]}
+
+
 def _get(url, timeout=20):
+    # 本地模式：/booku-memory/api/memories 由本地 SQLite 承担，不访问 8001
+    if "/booku-memory/api/memories" in url:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        person = (qs.get("person_id") or [""])[0]
+        limit = int((qs.get("limit") or ["200"])[0] or 200)
+        offset = int((qs.get("offset") or ["0"])[0] or 0)
+        return _local_items(person, limit, offset)
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.load(r)
 
@@ -214,9 +249,9 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
 def remember(title, content, person_id="", tags=None, importance=None, ts=None,
              origin="unknown", author="", source_event="", version=1):
     # 独立模式：不依赖任何平台，直接写本地库
-    if os.environ.get("MEM_WRITE_MODE", "auto") == "local":
+    if os.environ.get("MEM_WRITE_MODE", "local") == "local":
         r = ST.add(title, content, person=person_id, tags=tags or [], importance=importance, ts=ts,
-                   origin=origin, author=author, source_event=source_event, version=version)
+                   origin=origin, author=author, source_event=source_event, version=version, db=MEM_DB)
         return {"ok": True, "id": r["id"], "merged": r["merged"], "mode": "local"}
     payload = {"title": (title or "无题")[:60], "content": content or "",
                "folder_id": "default", "bucket": "memory", "memory_type": "event",
@@ -321,7 +356,7 @@ def profile(person_id):
     out = {"impression": "", "attitude": "", "name": "", "features": {},
            "impression_ts": 0, "attitude_ts": 0}
     try:
-        d = _get(MEM_INBOX + "?" + urllib.parse.urlencode({"person_id": person_id, "limit": 200}))
+        d = _local_items(person_id, 200)
         for it in d.get("items") or []:
             md = it.get("metadata") or {}
             tags = " ".join(str(x) for x in (md.get("core_tags") or []))
@@ -457,9 +492,10 @@ class H2(BaseHTTPRequestHandler):
             if self.path.startswith("/list"):
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 params = {k: v[0] for k, v in qs.items()}
-                url = MEM_INBOX + "?" + urllib.parse.urlencode(params)
-                with urllib.request.urlopen(url, timeout=30) as r:
-                    return self._send(200, json.load(r))
+                return self._send(200, _local_items(
+                    params.get("person_id", ""),
+                    int(params.get("limit", 200) or 200),
+                    int(params.get("offset", 0) or 0)))
             if self.path.startswith("/profile"):
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 return self._send(200, profile((qs.get("person_id") or [""])[0]))

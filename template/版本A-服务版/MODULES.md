@@ -83,7 +83,7 @@
 - **职责**：把检索、图谱、人物档案合成一个服务；对外只暴露一个地址。
 - **输入**：HTTP（`/recall` `/remember` `/relation` `/why` `/profile` `/health`）。
 - **输出**：召回结果、关系、档案、健康状态。
-- **依赖**：`hybrid.py`、`reranker_onnx.py`、`graph_server.py`、`MEM_DB`、`MEM_INBOX`。
+- **依赖**：`hybrid.py`、`reranker_onnx.py`、`graph_server.py`、`MEM_DB`；`MEM_INBOX` 仅旧版兼容时使用。
 - **边界**：
   - 只读记忆库；写入转发给 inbox，避免双写。
   - 不包含情绪计算、语气、人格、平台适配。

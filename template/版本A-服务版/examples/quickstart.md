@@ -48,7 +48,7 @@ curl -X POST http://127.0.0.1:8095/recall \
 
 ## 6. 接入自己的记忆
 
-写入走 `MEM_INBOX`（默认 `http://127.0.0.1:8001/booku-memory/api/memories`），
+写入默认直接写本地 SQLite；`MEM_INBOX` 仅旧版兼容时使用，
 或直接按 `sql/schema.sql` 写 `booku_memory_records`。
 
 **注意**：内核只读库；写入端负责去重、清洗、时间戳。

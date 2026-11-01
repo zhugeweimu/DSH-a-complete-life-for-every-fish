@@ -6,7 +6,7 @@
 写入方（聊天插件 / 脚本 / 导入器）
         │  POST /remember（或直接写库）
         ▼
-   MEM_INBOX（写入口，避免双写）
+   SQLite 直写（默认；旧版 MEM_INBOX 仅兼容）
         │
         ▼
    SQLite（booku_memory_records / tags / temporary_memos）
@@ -23,7 +23,7 @@
 
 ## 设计约束
 
-1. **只读库**：内核不写记忆库；写入统一走 `MEM_INBOX`。
+1. **默认自包含**：`MEM_WRITE_MODE=local` 直接写 SQLite；不再需要 8001/Neo-MoFox。
 2. **可降级**：没有向量服务 → 只走 BM25；没有重排模型 → 跳过重排。
 3. **独立进程**：检索、图谱、内核可分开部署，互不阻塞。
 4. **无框架**：只用标准库 `http.server` + SQLite，依赖面尽量小。

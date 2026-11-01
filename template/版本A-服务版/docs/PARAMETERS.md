@@ -36,7 +36,8 @@
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MEM_DB` | `./data/metadata.db` | 记忆库路径 |
-| `MEM_INBOX` | `http://127.0.0.1:8001/booku-memory/api/memories` | 写入转发端点 |
+| `MEM_WRITE_MODE` | `local` | `local` 直接写 SQLite；`auto` 仅兼容旧版 8001 |
+| `MEM_INBOX` | 空 | 仅 `MEM_WRITE_MODE=auto` 时使用的旧端点 |
 | `MEM_WRITE_MODE` | `auto` | `local` = 直接写本地；`auto` 有 inbox 就转发 |
 | `GRAPH_DIR` | `./data/graph` | 图谱数据目录 |
 | `CORE_PORT` / 端口参数 | 8095 | 内核端口 |

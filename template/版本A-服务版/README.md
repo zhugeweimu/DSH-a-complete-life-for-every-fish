@@ -66,7 +66,8 @@ MEM_DB=./data/metadata.db python src/memory_core.py 8095
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MEM_DB` | `./data/metadata.db` | 记忆库路径 |
-| `MEM_INBOX` | `http://127.0.0.1:8001/booku-memory/api/memories` | 写入端点（内核只读库，写入转发） |
+| `MEM_WRITE_MODE` | `local` | `local` 直接写 SQLite；`auto` 仅兼容旧版 8001 |
+| `MEM_INBOX` | 空 | 仅 `MEM_WRITE_MODE=auto` 时使用的旧端点 |
 | `GRAPH_DIR` | `./data/graph` | 图谱数据目录 |
 | `EMBED_URL` | `http://127.0.0.1:8081/v1/embeddings` | 向量服务（可选） |
 | `RERANK_MODEL` | 空 | ONNX 重排模型路径（可选） |
@@ -77,7 +78,7 @@ MEM_DB=./data/metadata.db python src/memory_core.py 8095
 |---|---|---|
 | GET | `/health` | 健康检查 |
 | POST | `/recall` | 召回：`{q, top, person, scope, rerank}` |
-| POST | `/remember` | 写入（转发到 `MEM_INBOX`） |
+| POST | `/remember` | 写入（默认直接写 SQLite） |
 | POST | `/relation` | 增加关系边 |
 | POST | `/why` | 解释某条关系/事件的证据 |
 | GET | `/relations?entity=` | 查关系 |

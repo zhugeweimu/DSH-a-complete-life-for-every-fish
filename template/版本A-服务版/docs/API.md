@@ -38,7 +38,7 @@ curl -X POST http://127.0.0.1:8095/remember \
   -d '{"title":"带药","content":"他今天给我带了药","person_id":"user:10001","tags":["关心"]}'
 ```
 
-写入会转发到 `MEM_INBOX`；内核自身不写库。
+默认 `MEM_WRITE_MODE=local`，直接写 SQLite；`MEM_INBOX` 仅旧版兼容时使用。
 
 ## 上下文（显式，不自动注入）
 

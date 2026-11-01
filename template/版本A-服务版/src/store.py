@@ -41,7 +41,8 @@ def _ensure_provenance(con):
     for name, ddl in (("origin", "TEXT NOT NULL DEFAULT 'unknown'"),
                       ("author", "TEXT NOT NULL DEFAULT ''"),
                       ("source_event", "TEXT NOT NULL DEFAULT ''"),
-                      ("version", "INTEGER NOT NULL DEFAULT 1")):
+                      ("version", "INTEGER NOT NULL DEFAULT 1"),
+                      ("bucket", "TEXT NOT NULL DEFAULT 'memory'")):
         if name not in cols:
             con.execute("ALTER TABLE booku_memory_records ADD COLUMN %s %s" % (name, ddl))
             if name == "origin":
@@ -144,13 +145,27 @@ def add(title, content, person="", tags=None, importance=None, folder="", memory
                     "kind": kind, "score": round(score, 3)}
         mid = fingerprint(title, content, person, memory_type)
         imp = _importance(title, importance)
-        con.execute(
-            "INSERT INTO booku_memory_records (memory_id,title,content,person_id,folder_id,"
-            "memory_type,importance,created_at,updated_at,last_activated_at,activation_count,is_deleted,"
-            "origin,author,source_event,version)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)",
-            (mid, title, content, person or "", folder or "", memory_type, imp, ts, ts, ts,
-             origin or "unknown", author or "", source_event or "", int(version or 1)))
+        vals = {
+            "memory_id": mid, "title": title, "content": content,
+            "person_id": person or "", "folder_id": folder or "",
+            "bucket": "memory", "source": "memory_core",
+            "memory_type": memory_type, "status": "active",
+            "importance": imp, "created_at": ts, "updated_at": ts,
+            "last_activated_at": ts, "activation_count": 0,
+            "is_archived": 0, "is_deleted": 0, "deleted_at": 0,
+            "relation_memory_ids": "[]", "relation_aliases": "[]",
+            "related_people": "[]", "event_start_at": 0, "event_end_at": 0,
+            "knowledge_type": "", "address_or_coord": "", "place_type": "",
+            "asset_type": "", "disposition_status": "", "procedure_type": "",
+            "novelty_energy": 0, "origin": origin or "unknown",
+            "author": author or "", "source_event": source_event or "",
+            "version": int(version or 1),
+        }
+        cols = [r[1] for r in con.execute("PRAGMA table_info(booku_memory_records)")]
+        use = [c for c in cols if c in vals]
+        con.execute("INSERT INTO booku_memory_records (%s) VALUES (%s)" %
+                    (",".join(use), ",".join("?" for _ in use)),
+                    [vals[c] for c in use])
         for t in tags or []:
             con.execute("INSERT INTO booku_memory_tags (memory_id,tag_type,tag_value) VALUES (?,?,?)",
                         (mid, "core", t))
