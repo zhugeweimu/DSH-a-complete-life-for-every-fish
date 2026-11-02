@@ -41,14 +41,17 @@ def get_index(db):
         return ent
 
 
-def do_search(q, top=5, mode="hybrid", rerank="off", db=None, person=None, scope="all"):
+def do_search(q, top=5, mode="hybrid", rerank="off", db=None, person=None, scope="all",
+              namespace="chat"):
     db = db or DEFAULT_DB
-    ck = (db, q, top, mode, rerank, person, scope)
+    ck = (db, q, top, mode, rerank, person, scope, namespace)
     if ck in _rcache:
         return _rcache[ck]
     ent = get_index(db)
     all_docs = ent["docs"]
     docs = all_docs
+    if namespace and namespace != "all":
+        docs = [d for d in docs if (d.get("namespace") or "chat") == namespace]
     if person and scope == "person":
         # 严格隔离模式（默认不用）：只检索这个人自己的 + 公共记忆
         docs = [d for d in docs if (d.get("person") or "") in ("", person)]
@@ -127,7 +130,7 @@ class H2(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "q required"})
             r = do_search(q, int(d.get("top") or 5), d.get("mode") or "hybrid",
                           d.get("rerank") or "off", d.get("db"), d.get("person"),
-                          d.get("scope") or "all")
+                          d.get("scope") or "all", d.get("namespace") or "chat")
             return self._send(200, r)
         except Exception as e:
             self._send(500, {"error": repr(e)})
