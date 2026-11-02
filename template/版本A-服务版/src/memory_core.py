@@ -610,7 +610,7 @@ class H2(BaseHTTPRequestHandler):
                 r = remember(title, ev, d.get("person_id") or "self:agent",
                              [kind] + list(d.get("tags") or []),
                              importance=d.get("importance"),
-                             namespace=d.get("namespace") or "game")
+                             namespace=d.get("namespace") or ("game" if str(kind).startswith("游戏") else "chat"))
                 return self._send(200, {"ok": True, "id": r.get("id") or "", "kind": kind})
             if self.path.startswith("/remember"):
                 return self._send(200, remember(d.get("title"), d.get("content"),
