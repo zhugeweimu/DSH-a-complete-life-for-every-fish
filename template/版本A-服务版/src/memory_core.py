@@ -271,6 +271,9 @@ _WARM_LOCK = threading.Lock()
 
 def _warm_async():
     """后台把向量索引追平；新写入不再等第一次查询才建索引。"""
+    import vector_store as _VS
+    _VS._WARMING = True
+
     def run():
         if not _WARM_LOCK.acquire(blocking=False):
             return
