@@ -41,7 +41,7 @@ def load_corpus(db_path):
     rows = con.execute(
         "SELECT memory_id, title, content, folder_id, created_at, memory_type, person_id, "
           "COALESCE(last_activated_at,0) AS last_activated, "
-          "importance "
+          "importance, namespace "
         "FROM booku_memory_records WHERE is_deleted=0").fetchall()
     tags = {}
     try:
@@ -60,6 +60,7 @@ def load_corpus(db_path):
             "ts": r["created_at"] or 0,
             "last_activated": r["last_activated"] or 0,
             "importance": r["importance"],
+            "namespace": (r["namespace"] if "namespace" in r.keys() else "chat") or "chat",
             "type": r["memory_type"] or "",
             "tags": tags.get(r["memory_id"], []),
         })
@@ -78,6 +79,7 @@ def load_corpus(db_path):
                 "ts": r["start_ts"] or 0,
                 "last_activated": 0,
                 "importance": float(r["importance"] or r["weight"] or 0.5),
+                "namespace": "chat",
                 "type": r["event_type"] or "event",
                 "tags": ["事件", "旧记录" if r["legacy"] else "会话"],
             })

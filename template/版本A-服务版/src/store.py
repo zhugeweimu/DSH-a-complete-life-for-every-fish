@@ -42,7 +42,8 @@ def _ensure_provenance(con):
                       ("author", "TEXT NOT NULL DEFAULT ''"),
                       ("source_event", "TEXT NOT NULL DEFAULT ''"),
                       ("version", "INTEGER NOT NULL DEFAULT 1"),
-                      ("bucket", "TEXT NOT NULL DEFAULT 'memory'")):
+                      ("bucket", "TEXT NOT NULL DEFAULT 'memory'"),
+                      ("namespace", "TEXT NOT NULL DEFAULT 'chat'")):
         if name not in cols:
             con.execute("ALTER TABLE booku_memory_records ADD COLUMN %s %s" % (name, ddl))
             if name == "origin":
@@ -124,9 +125,19 @@ def _merge(con, dup, title, content, tags, ts):
                     (dup["memory_id"], "core", t))
 
 
+def canon_person(person):
+    p = str(person or "").strip()
+    if p.startswith("qq:"):
+        return "user:" + p
+    return p
+
+
 def add(title, content, person="", tags=None, importance=None, folder="", memory_type="event",
-        ts=None, db=None, origin="unknown", author="", source_event="", version=1):
+        ts=None, db=None, origin="unknown", author="", source_event="", version=1,
+        namespace="chat"):
     """写入一条；返回 {"id","merged","dup_id","score"}"""
+    person = canon_person(person)
+
     title = normalize_title(title)
     content = (content or "").strip()
     if not content:
@@ -149,6 +160,7 @@ def add(title, content, person="", tags=None, importance=None, folder="", memory
             "memory_id": mid, "title": title, "content": content,
             "person_id": person or "", "folder_id": folder or "",
             "bucket": "memory", "source": "memory_core",
+            "namespace": namespace or "chat",
             "memory_type": memory_type, "status": "active",
             "importance": imp, "created_at": ts, "updated_at": ts,
             "last_activated_at": ts, "activation_count": 0,
@@ -182,7 +194,8 @@ def add_batch(items, db=None):
                 folder=item.get("folder", ""), memory_type=item.get("memory_type", "event"),
                 ts=item.get("ts"), db=db,
         origin=item.get("origin", "unknown"), author=item.get("author", ""),
-        source_event=item.get("source_event", ""), version=item.get("version", 1)) for item in items]
+        source_event=item.get("source_event", ""), version=item.get("version", 1),
+        namespace=item.get("namespace", "chat")) for item in items]
 
 
 def ingest_jsonl(path, db=None):

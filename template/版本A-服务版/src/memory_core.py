@@ -181,10 +181,11 @@ def _cleanup_flow():
         pass
 
 
-def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=None):
+def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=None, namespace="chat"):
     ent = _index()
     all_docs = ent["docs"]
     bm_all = ent["bm"]
+    person = ST.canon_person(person)
 
     # 先做过滤条件，但向量索引始终基于全库；候选召回后再过滤
     allow = None
@@ -192,7 +193,9 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
         allow = {"", person, "self:agent"}
     docs = []
     for d in all_docs:
-        if allow is not None and (d.get("person") or "") not in allow:
+        if namespace and namespace != "all" and (d.get("namespace") or "chat") != namespace:
+            continue
+        if allow is not None and ST.canon_person(d.get("person")) not in allow:
             continue
         if since and float(d.get("ts") or 0) < float(since):
             continue
@@ -288,16 +291,18 @@ def _warm_async():
 
 
 def remember(title, content, person_id="", tags=None, importance=None, ts=None,
-             origin="unknown", author="", source_event="", version=1):
+             origin="unknown", author="", source_event="", version=1, namespace="chat"):
     # 独立模式：不依赖任何平台，直接写本地库
     if os.environ.get("MEM_WRITE_MODE", "local") == "local":
         r = ST.add(title, content, person=person_id, tags=tags or [], importance=importance, ts=ts,
-                   origin=origin, author=author, source_event=source_event, version=version, db=MEM_DB)
+                   origin=origin, author=author, source_event=source_event, version=version,
+                   db=MEM_DB, namespace=namespace)
         _warm_async()
         return {"ok": True, "id": r["id"], "merged": r["merged"], "mode": "local"}
     payload = {"title": (title or "无题")[:60], "content": content or "",
                "folder_id": "default", "bucket": "memory", "memory_type": "event",
                "status": "active", "person_id": person_id,
+               "namespace": namespace or "chat",
                "core_tags": tags or ["对话"], "diffusion_tags": ["core"],
                "opposing_tags": ["未分类"],
         "origin": d.get("origin", "unknown"), "author": d.get("author", ""),
@@ -395,6 +400,7 @@ def _expand(events, pad_hours=12):
 
 
 def profile(person_id):
+    person_id = ST.canon_person(person_id)
     out = {"impression": "", "attitude": "", "name": "", "features": {},
            "impression_ts": 0, "attitude_ts": 0}
     try:
@@ -557,7 +563,8 @@ class H2(BaseHTTPRequestHandler):
                 return self._send(200, recall(d.get("q") or "", int(d.get("top") or 6),
                                               d.get("person") or "", d.get("scope") or "all",
                                               d.get("rerank") or "bge",
-                                              since=d.get("since"), until=d.get("until")))
+                                              since=d.get("since"), until=d.get("until"),
+                                              namespace=d.get("namespace") or "chat"))
             if self.path.startswith("/consolidate"):
                 return self._send(200, CO.run(db=MEM_DB,
                                              archive_days=int(d.get("archive_days") or 30),
@@ -575,7 +582,8 @@ class H2(BaseHTTPRequestHandler):
                     int(d.get("top") or 5), int(d.get("max_chars") or 1200), db=MEM_DB,
                     include_self=bool(d.get("include_self")),
                     diary_days=int(d.get("diary_days") or 0),
-                    min_score=float(d.get("min_score") or 0)))
+                    min_score=float(d.get("min_score") or 0),
+                    namespace=d.get("namespace") or "chat"))
             if self.path.startswith("/log"):
                 import turnlog as TL
                 r = TL.append(d.get("person") or "", d.get("user") or "", d.get("reply") or "",
@@ -601,12 +609,14 @@ class H2(BaseHTTPRequestHandler):
                 title = d.get("title") or (kind + " " + time.strftime("%m-%d %H:%M"))
                 r = remember(title, ev, d.get("person_id") or "self:agent",
                              [kind] + list(d.get("tags") or []),
-                             importance=d.get("importance"))
+                             importance=d.get("importance"),
+                             namespace=d.get("namespace") or "game")
                 return self._send(200, {"ok": True, "id": r.get("id") or "", "kind": kind})
             if self.path.startswith("/remember"):
                 return self._send(200, remember(d.get("title"), d.get("content"),
                                                 d.get("person_id") or "", d.get("tags"),
-                                                importance=d.get("importance")))
+                                                importance=d.get("importance"),
+                                                namespace=d.get("namespace") or "chat"))
             if self.path.startswith("/relation"):
                 r = G.add_relation(d.get("subject") or "", d.get("predicate") or "",
                                    d.get("object") or "", d.get("note") or "",

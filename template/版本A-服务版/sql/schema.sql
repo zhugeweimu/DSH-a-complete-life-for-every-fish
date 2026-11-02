@@ -79,3 +79,6 @@ CREATE TABLE IF NOT EXISTS event_records (
 );
 CREATE INDEX IF NOT EXISTS idx_event_person ON event_records (person, start_ts);
 CREATE INDEX IF NOT EXISTS idx_event_active ON event_records (is_archived);
+
+-- 记忆分区：chat / game / voice / system
+ALTER TABLE booku_memory_records ADD COLUMN namespace TEXT NOT NULL DEFAULT 'chat';
