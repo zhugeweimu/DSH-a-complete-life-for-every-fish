@@ -3,3 +3,6 @@
 numpy>=1.24
 # 可选：启用 ONNX 重排时需要
 onnxruntime>=1.16 ; extra == "rerank"
+
+# 向量索引：HNSW 粗筛（可选，但原生版默认启用）
+faiss-cpu>=1.8

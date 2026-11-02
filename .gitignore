@@ -8,3 +8,5 @@ __pycache__/
 node_modules/
 .venv/
 .DS_Store
+
+template/版本A-服务版/data/

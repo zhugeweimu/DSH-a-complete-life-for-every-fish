@@ -141,7 +141,7 @@ class BM25:
 def embed(texts):
     out = []
     for t in texts:
-        body = json.dumps({"model": EMB_MODEL, "input": t}, ensure_ascii=False).encode()
+        body = json.dumps({"model": EMB_MODEL, "input": (t or "")[:300]}, ensure_ascii=False).encode()
         req = urllib.request.Request(EMB_URL, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as r:
             d = json.loads(r.read().decode())
@@ -159,6 +159,12 @@ def cosine(a, b):
 
 
 def dense_search(docs, q, top=50, cache_path=""):
+    # 优先走 FAISS：HNSW 粗筛 + 候选精确 cosine；失败再回退旧缓存
+    try:
+        import vector_store as VS
+        return VS.search(docs, q, embed, top=max(50, int(top)))
+    except Exception:
+        pass
     vecs = {}
     if cache_path and os.path.isfile(cache_path):
         try:

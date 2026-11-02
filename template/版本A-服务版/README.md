@@ -8,9 +8,9 @@
 一套可独立运行的中文长期记忆内核：
 
 ```
-存储   SQLite（记录 / 标签 / 临时备忘 / 图谱三表）
+存储   SQLite（记录 / 标签 / 图谱三表）
 索引   BM25（中文二元切分）
-语义   bge 向量（可选，走外部 /v1/embeddings）
+语义   bge 向量 + FAISS HNSW（ANN 粗筛，候选精确 cosine）
 融合   RRF（字面 + 语义）
 重排   BGE reranker（可选，ONNX）
 衰减   时间衰减 × 重要性 × 最近激活
@@ -36,6 +36,7 @@ memory-core/
 │  ├─ autocapture.py      自动抽取：普通对话也能落事件（fact/preference/plan/promise/relationship/event/note）；默认由 `/log` 触发，`MEM_AUTOCAPTURE=0` 可关闭，宿主也可自行调 `/ingest` 完全自定义
 │  ├─ store_cli.py        写入命令行：add/batch/ingest/turns/list/show
 │  ├─ hybrid.py           BM25 + 向量 + RRF + 语料加载
+│  ├─ vector_store.py     FAISS HNSW 粗筛 + 候选精确 cosine
 │  ├─ reranker_onnx.py    ONNX 交叉编码器重排（可选）
 │  ├─ retrieval_server.py 只管检索的轻量服务
 │  └─ graph_server.py     实体 / 关系 / 事件图谱
@@ -70,7 +71,8 @@ MEM_DB=./data/metadata.db python src/memory_core.py 8095
 | `MEM_INBOX` | 空 | 仅 `MEM_WRITE_MODE=auto` 时使用的旧端点 |
 | `MEM_AUTOCAPTURE` | `1` | `1` 让 `/log` 自动调用 autocapture；`0` 关闭，宿主可自行调 `/ingest` |
 | `GRAPH_DIR` | `./data/graph` | 图谱数据目录 |
-| `EMBED_URL` | `http://127.0.0.1:8081/v1/embeddings` | 向量服务（可选） |
+| `VECTOR_DIR` | `./data` | FAISS 索引 / 向量 / id 映射目录 |
+| `EMBED_URL` | `http://127.0.0.1:8081/v1/embeddings` | 向量服务；启用 FAISS 时必需 |
 | `RERANK_MODEL` | 空 | ONNX 重排模型路径（可选） |
 
 ## API（8095）
