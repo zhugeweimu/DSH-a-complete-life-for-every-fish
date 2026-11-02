@@ -386,10 +386,6 @@ def profile(person_id):
             out["features"] = json.loads(row[1] or "{}")
         except Exception:
             out["features"] = {}
-    try:
-        out["relations"] = G.current_relations(person_id)
-    except Exception:
-        out["relations"] = []
     return out
 
 
