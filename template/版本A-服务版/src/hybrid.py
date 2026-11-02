@@ -23,11 +23,13 @@ import sqlite3
 import sys
 import time
 import urllib.request
+import threading
 
 EMB_URL = os.environ.get("EMB_URL", "http://127.0.0.1:8081/v1/embeddings")
 EMB_MODEL = os.environ.get("EMB_MODEL", "bge-small-zh-v1.5-f16")
 RERANK_URL = os.environ.get("RERANK_URL", "")          # 例：http://127.0.0.1:8082/v1/rerank
 CACHE = os.environ.get("HYBRID_CACHE", "")             # 向量缓存 json
+_EMB_SEM = threading.BoundedSemaphore(4)
 
 CJK = re.compile(r"[\u4e00-\u9fff]")
 
@@ -139,14 +141,34 @@ class BM25:
 
 # ---------------- 语义 ----------------
 def embed(texts):
-    out = []
-    for t in texts:
-        body = json.dumps({"model": EMB_MODEL, "input": (t or "")[:300]}, ensure_ascii=False).encode()
-        req = urllib.request.Request(EMB_URL, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            d = json.loads(r.read().decode())
-        out.append((d.get("data") or [{}])[0].get("embedding") or [])
-    return out
+    """有界并发：最多 4 个请求同时打到 BGE，避免一次性压垮服务。"""
+    import concurrent.futures
+    import threading
+    workers = max(1, min(4, int(os.environ.get("EMBED_WORKERS", "4"))))
+    sem = _EMB_SEM
+
+    def one(t):
+        last = None
+        for attempt in range(3):
+            with sem:
+                try:
+                    body = json.dumps({"model": EMB_MODEL, "input": (t or "")[:300]},
+                                      ensure_ascii=False).encode()
+                    req = urllib.request.Request(EMB_URL, data=body,
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        d = json.loads(r.read().decode())
+                    v = (d.get("data") or [{}])[0].get("embedding") or []
+                    if v:
+                        return v
+                    last = RuntimeError("empty embedding")
+                except Exception as e:
+                    last = e
+                    time.sleep(0.2 * (attempt + 1))
+        raise last
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(one, texts))
 
 
 def cosine(a, b):

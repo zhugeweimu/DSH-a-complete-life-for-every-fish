@@ -176,10 +176,17 @@ def search(docs, q, embed_fn, top=80):
     if _STATE["index"] is None and _WARMING:
         raise RuntimeError("向量索引正在后台构建")
     with _LOCK:
-        index, vecs, ids, doc_map = _ensure(docs, embed_fn)
-        pos = {str(x): i for i, x in enumerate(ids)}
+        _ensure(docs, embed_fn)
         tombs = _tombstones()
-        qv = _norm(embed_fn([q]))[0]
+    # query embedding 不占索引锁，4 路并发在这里生效
+    qv = _norm(embed_fn([q]))[0]
+    with _LOCK:
+        index = _STATE["index"]
+        vecs = _STATE["vecs"]
+        ids = _STATE["ids"]
+        doc_map = _STATE["doc_map"]
+        if index is None:
+            raise RuntimeError("向量索引未就绪")
         index.hnsw.efSearch = max(64, min(512, int(top) * 2))
         _d, ind = index.search(qv.reshape(1, -1), min(max(int(top) * 3, 120), len(ids)))
         best = {}

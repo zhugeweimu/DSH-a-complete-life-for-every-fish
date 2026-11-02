@@ -23,6 +23,7 @@ MODEL_DIR = os.environ.get("RERANK_MODEL_DIR",
 MAX_LEN = int(os.environ.get("RERANK_MAX_LEN") or 192)
 
 _lock = threading.Lock()
+_sem = threading.BoundedSemaphore(int(os.environ.get("RERANK_CONCURRENCY", "2")))
 _sess = None
 _tok = None
 
@@ -58,6 +59,11 @@ def _sigmoid(x):
 
 def score_pairs(pairs):
     """[(query, doc), ...] → [0..1] 分数。"""
+    with _sem:
+        return _score_pairs(pairs)
+
+
+def _score_pairs(pairs):
     sess, tok = _load()
     encs = tok.encode_batch([(q, d) for q, d in pairs])
     feed = {
