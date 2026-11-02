@@ -47,15 +47,25 @@ def do_search(q, top=5, mode="hybrid", rerank="off", db=None, person=None, scope
     if ck in _rcache:
         return _rcache[ck]
     ent = get_index(db)
-    docs, bm = ent["docs"], ent["bm"]
+    all_docs = ent["docs"]
+    docs = all_docs
     if person and scope == "person":
         # 严格隔离模式（默认不用）：只检索这个人自己的 + 公共记忆
         docs = [d for d in docs if (d.get("person") or "") in ("", person)]
-        bm = H.BM25(docs)
     if not docs:
         return {"error": "库里没有记录", "q": q}
+    bm = H.BM25(docs)
     lex = bm.search(q, top=50) if mode in ("hybrid", "lex") else []
-    dense = H.dense_search(docs, q, top=50, cache_path=H.CACHE) if mode in ("hybrid", "dense") else []
+    dense = []
+    if mode in ("hybrid", "dense"):
+        try:
+            pos = {str(d["id"]): i for i, d in enumerate(docs)}
+            for sc, ai in H.dense_search(all_docs, q, top=max(200, top * 30), cache_path=H.CACHE):
+                did = str(all_docs[ai]["id"])
+                if did in pos:
+                    dense.append((sc, pos[did]))
+        except Exception:
+            dense = []
     fused = H.rrf([x for x in (lex, dense) if x])
     if rerank == "off":
         picked = [(b, i, {}) for i, b in fused[:top]]

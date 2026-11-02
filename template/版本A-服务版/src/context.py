@@ -50,12 +50,23 @@ def _decay(ts, last_active, importance, now=None):
 
 
 def _memories(person, q, top, db, now, min_score):
-    docs = [d for d in H.load_corpus(_db(db)) if not person or (d.get("person") or "") == person]
+    all_docs = H.load_corpus(_db(db))
+    docs = [d for d in all_docs if not person or (d.get("person") or "") == person]
     if not docs:
         return []
     if q:
         bm = H.BM25(docs)
-        ranked = [(s, i) for s, i in bm.search(q, top=max(top * 3, 10))]
+        lex = [(s, i) for s, i in bm.search(q, top=max(top * 3, 10))]
+        dense = []
+        try:
+            pos = {str(d["id"]): i for i, d in enumerate(docs)}
+            for sc, ai in H.dense_search(all_docs, q, top=max(200, top * 30)):
+                did = str(all_docs[ai]["id"])
+                if did in pos:
+                    dense.append((sc, pos[did]))
+        except Exception:
+            dense = []
+        ranked = [(s, i) for i, s in H.rrf([x for x in (lex, dense) if x])]
     else:
         ranked = [(0.0, i) for i in range(len(docs))]
     scored = []

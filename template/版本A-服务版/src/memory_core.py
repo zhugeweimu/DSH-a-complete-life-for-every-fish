@@ -183,16 +183,25 @@ def _cleanup_flow():
 
 def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=None):
     ent = _index()
-    docs, bm = ent["docs"], ent["bm"]
+    all_docs = ent["docs"]
+    bm_all = ent["bm"]
+
+    # 先做过滤条件，但向量索引始终基于全库；候选召回后再过滤
+    allow = None
     if person and scope == "person":
-        # 只给：当前这个人的 + 她自己的(self:agent) + 公共的(空)
         allow = {"", person, "self:agent"}
-        docs = [d for d in docs if (d.get("person") or "") in allow]
-        bm = H.BM25(docs)
-    if since or until:
-        docs = [d for d in docs if (not since or float(d.get("ts") or 0) >= float(since))
-                and (not until or float(d.get("ts") or 0) <= float(until))]
-        bm = H.BM25(docs)
+    docs = []
+    for d in all_docs:
+        if allow is not None and (d.get("person") or "") not in allow:
+            continue
+        if since and float(d.get("ts") or 0) < float(since):
+            continue
+        if until and float(d.get("ts") or 0) > float(until):
+            continue
+        docs.append(d)
+    if not docs:
+        return {"q": q, "mode": "empty", "corpus": 0, "results": []}
+
     if not (q or "").strip():
         cand = sorted(docs, key=lambda d: -(_importance(d.get("title"), d.get("importance")) * 1000
                                             + (d.get("ts") or 0) / 1e9))
@@ -210,17 +219,21 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
             x["score_norm"] = round(x["score"] / top_score, 4) if top_score else 0.0
             _bump(x["id"])
         return {"q": q, "mode": "time-window", "corpus": len(docs), "results": out}
+
+    bm = H.BM25(docs)
     lex = bm.search(q, top=50)
+    dense = []
     try:
-        dense = H.dense_search(docs, q, top=50, cache_path=os.environ.get("HYBRID_CACHE", ""))
-    except Exception as e:
+        pos = {str(d["id"]): i for i, d in enumerate(docs)}
+        want = max(200, min(len(all_docs), int(top) * 30))
+        for sc, ai in H.dense_search(all_docs, q, top=want):
+            did = str(all_docs[ai]["id"])
+            if did in pos:
+                dense.append((sc, pos[did]))
+    except Exception:
         dense = []
-        degraded = "（向量服务不可用，仅 BM25：%r）" % (e,)
-    else:
-        degraded = ""
+
     fused = H.rrf([x for x in (lex, dense) if x])
-    if degraded and not fused:
-        fused = lex
     if rerank == "bge":
         try:
             picked = R.rerank(q, docs, fused, top)
