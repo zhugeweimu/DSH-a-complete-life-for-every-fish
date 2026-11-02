@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""FAISS 向量索引：HNSW 粗筛 + 候选精确 cosine。
+"""FAISS 向量索引：分块 + HNSW 粗筛 + 候选精确 cosine + 墓碑/compact。
 
 设计：
-  · 索引是全库的，不做 person/时间过滤；过滤放在候选召回之后。
-  · 新增记忆只增量 add；内容修改/删除才重建。
-  · 索引层允许近似，检索层对候选重新精确打分。
+  · 长记忆按约 280 字分块，解决 BGE 上下文截断。
+  · HNSW 只粗筛；命中块再和原记忆做精确 cosine。
+  · 新增块增量 add；修改/删除用墓碑，墓碑过多才 compact。
 """
 from __future__ import annotations
 
@@ -21,21 +21,21 @@ except Exception:  # pragma: no cover
     faiss = None
 
 _LOCK = threading.Lock()
-_STATE = {"hashes": {}, "ids": [], "vecs": None, "index": None, "dim": 0}
+_WARMING = False
+_STATE = {"chunks": {}, "ids": [], "vecs": None, "index": None, "dim": 0, "doc_map": {}}
 
 VECTOR_DIR = os.path.abspath(os.environ.get(
     "VECTOR_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")))
 INDEX_PATH = os.path.join(VECTOR_DIR, "vector.faiss")
 META_PATH = os.path.join(VECTOR_DIR, "vector_meta.json")
 VECS_PATH = os.path.join(VECTOR_DIR, "vector.npy")
+CHUNK = 280
+OVERLAP = 40
+COMPACT_RATIO = 0.30
 
 
-def _h(d):
-    x = hashlib.sha1()
-    x.update(str(d.get("id") or "").encode("utf-8"))
-    x.update(b"\x00")
-    x.update((d.get("text") or "")[:2000].encode("utf-8"))
-    return x.hexdigest()
+def _h(s):
+    return hashlib.sha1(str(s or "").encode("utf-8")).hexdigest()[:16]
 
 
 def _norm(a):
@@ -45,29 +45,56 @@ def _norm(a):
     return a / n
 
 
-def _save(index, vecs, ids, hashes):
+def _chunks(text):
+    t = (text or "").strip()
+    if not t:
+        return [""]
+    out = []
+    i = 0
+    while i < len(t):
+        out.append(t[i:i + CHUNK])
+        if i + CHUNK >= len(t):
+            break
+        i += CHUNK - OVERLAP
+    return out
+
+
+def _collect(docs):
+    """返回 (chunk_id, doc_index, chunk_text, chunk_hash) 列表。"""
+    out = []
+    for di, d in enumerate(docs):
+        did = str(d.get("id"))
+        for ci, part in enumerate(_chunks(d.get("text", ""))):
+            cid = did + "\x1f" + _h(part)
+            out.append((cid, di, part, _h(part)))
+    return out
+
+
+def _save(index, vecs, ids, meta):
     os.makedirs(VECTOR_DIR, exist_ok=True)
     open(INDEX_PATH + ".tmp", "wb").write(faiss.serialize_index(index))
     os.replace(INDEX_PATH + ".tmp", INDEX_PATH)
     np.save(VECS_PATH + ".tmp.npy", vecs)
     os.replace(VECS_PATH + ".tmp.npy", VECS_PATH)
     with open(META_PATH + ".tmp", "w", encoding="utf-8") as f:
-        json.dump({"ids": ids, "hashes": hashes, "dim": int(vecs.shape[1])},
-                  f, ensure_ascii=False)
+        json.dump(meta, f, ensure_ascii=False)
     os.replace(META_PATH + ".tmp", META_PATH)
 
 
 def _build(docs, embed_fn):
-    if faiss is None:
-        raise RuntimeError("faiss-cpu 未安装")
-    vecs = _norm(embed_fn([d.get("text", "")[:2000] for d in docs]))
+    chunks = _collect(docs)
+    if not chunks:
+        raise RuntimeError("没有可索引内容")
+    vecs = _norm(embed_fn([c[2] for c in chunks]))
     index = faiss.IndexHNSWFlat(int(vecs.shape[1]), 32, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = 200
     index.add(vecs)
-    ids = [d.get("id") for d in docs]
-    hashes = {str(d.get("id")): _h(d) for d in docs}
-    _save(index, vecs, ids, hashes)
-    return index, vecs, ids, hashes
+    ids = [c[0] for c in chunks]
+    meta = {"ids": ids, "hashes": {c[0]: c[3] for c in chunks},
+            "docs": {c[0]: c[1] for c in chunks}, "dim": int(vecs.shape[1]),
+            "tombstones": []}
+    _save(index, vecs, ids, meta)
+    return index, vecs, ids, meta
 
 
 def _load():
@@ -75,60 +102,111 @@ def _load():
         return None
     with open(META_PATH, encoding="utf-8") as f:
         meta = json.load(f)
-    if "hashes" not in meta:
+    if "hashes" not in meta or "docs" not in meta:
         return None
     index = faiss.deserialize_index(np.frombuffer(open(INDEX_PATH, "rb").read(), dtype=np.uint8))
     vecs = np.load(VECS_PATH)
-    return index, vecs, meta.get("ids") or [], meta.get("hashes") or {}
+    return index, vecs, meta
 
 
 def _ensure(docs, embed_fn):
     if faiss is None:
         raise RuntimeError("faiss-cpu 未安装")
-    cur = {str(d.get("id")): _h(d) for d in docs}
-    if _STATE["index"] is not None and cur == _STATE["hashes"]:
-        return _STATE["index"], _STATE["vecs"], _STATE["ids"]
+    chunks = _collect(docs)
+    cur = {c[0]: c[3] for c in chunks}
+    if _STATE["index"] is not None and cur == _STATE["chunks"]:
+        return _STATE["index"], _STATE["vecs"], _STATE["ids"], _STATE["doc_map"]
     loaded = _load()
     if loaded:
-        index, vecs, ids, old = loaded
-        old_ids = [str(x) for x in ids]
-        added = [d for d in docs if str(d.get("id")) not in old]
-        changed = any(str(i) in cur and cur[str(i)] != old.get(str(i)) for i in old_ids)
-        removed = any(str(i) not in cur for i in old_ids)
-        if not changed and not removed:
-            if added:
-                nv = _norm(embed_fn([d.get("text", "")[:2000] for d in added]))
-                index.add(nv)
-                vecs = np.vstack([vecs, nv])
-                ids = old_ids + [str(d.get("id")) for d in added]
-                hashes = dict(old)
-                hashes.update({str(d.get("id")): _h(d) for d in added})
-                _save(index, vecs, ids, hashes)
-            else:
-                hashes = old
-            _STATE.update({"hashes": cur, "ids": [str(x) for x in ids], "vecs": vecs,
-                           "index": index, "dim": int(vecs.shape[1])})
-            return index, vecs, _STATE["ids"]
-    index, vecs, ids, hashes = _build(docs, embed_fn)
-    _STATE.update({"hashes": cur, "ids": [str(x) for x in ids], "vecs": vecs,
-                   "index": index, "dim": int(vecs.shape[1])})
-    return index, vecs, _STATE["ids"]
+        index, vecs, meta = loaded
+        old = meta.get("hashes") or {}
+        ids = [str(x) for x in (meta.get("ids") or [])]
+        doc_map = {str(k): int(v) for k, v in (meta.get("docs") or {}).items()}
+        tombs = set(str(x) for x in (meta.get("tombstones") or []))
+        added = [c for c in chunks if c[0] not in old]
+        removed = [cid for cid in ids if cid not in cur]
+        changed = any(cid in cur and cur[cid] != old.get(cid) for cid in ids)
+        for cid in removed:
+            tombs.add(cid)
+        if changed:
+            # 同一记忆内容变化：按 doc 级旧块做墓碑，再补新块
+            for c in chunks:
+                pass
+            for cid in ids:
+                if cid not in cur:
+                    tombs.add(cid)
+        if removed or changed:
+            # 旧块标墓碑；新块直接加
+            pass
+        if added:
+            nv = _norm(embed_fn([c[2] for c in added]))
+            index.add(nv)
+            vecs = np.vstack([vecs, nv])
+            ids += [c[0] for c in added]
+            for cid, di, _p, hh in added:
+                old[cid] = hh
+                doc_map[cid] = di
+        tomb_list = sorted(tombs)
+        if len(tomb_list) > max(8, int(len(ids) * COMPACT_RATIO)):
+            index, vecs, ids, meta = _build(docs, embed_fn)
+            _STATE.update({"chunks": cur, "ids": ids, "vecs": vecs, "index": index,
+                           "dim": int(vecs.shape[1]), "doc_map": meta["docs"]})
+            return index, vecs, ids, meta["docs"]
+        _save(index, vecs, ids, {"ids": ids, "hashes": old, "docs": doc_map,
+                                 "dim": int(vecs.shape[1]), "tombstones": tomb_list})
+        _STATE.update({"chunks": cur, "ids": ids, "vecs": vecs, "index": index,
+                       "dim": int(vecs.shape[1]), "doc_map": doc_map})
+        return index, vecs, ids, doc_map
+    index, vecs, ids, meta = _build(docs, embed_fn)
+    _STATE.update({"chunks": cur, "ids": ids, "vecs": vecs, "index": index,
+                   "dim": int(vecs.shape[1]), "doc_map": meta["docs"]})
+    return index, vecs, ids, meta["docs"]
+
+
+def _tombstones():
+    try:
+        with open(META_PATH, encoding="utf-8") as f:
+            return set(json.load(f).get("tombstones") or [])
+    except Exception:
+        return set()
 
 
 def search(docs, q, embed_fn, top=80):
-    """返回 [(exact_cosine, doc_index), ...]；索引全库，调用方负责过滤。"""
+    """返回 [(exact_cosine, doc_index), ...]；分块命中后按记忆去重。"""
+    if _STATE["index"] is None and _WARMING:
+        raise RuntimeError("向量索引正在后台构建")
     with _LOCK:
-        index, vecs, ids = _ensure(docs, embed_fn)
+        index, vecs, ids, doc_map = _ensure(docs, embed_fn)
         pos = {str(x): i for i, x in enumerate(ids)}
+        tombs = _tombstones()
         qv = _norm(embed_fn([q]))[0]
-        index.hnsw.efSearch = max(64, min(256, int(top) * 2))
-        _d, ind = index.search(qv.reshape(1, -1), min(int(top), len(ids)))
-        out = []
+        index.hnsw.efSearch = max(64, min(512, int(top) * 2))
+        _d, ind = index.search(qv.reshape(1, -1), min(max(int(top) * 3, 120), len(ids)))
+        best = {}
         for i in ind[0]:
             if i < 0:
                 continue
-            di = pos.get(str(ids[i]))
-            if di is not None:
-                out.append((float(np.dot(vecs[i], qv)), di))
-        out.sort(key=lambda x: -x[0])
-        return out
+            cid = str(ids[i])
+            if cid in tombs:
+                continue
+            di = doc_map.get(cid)
+            if di is None:
+                continue
+            sc = float(np.dot(vecs[i], qv))
+            if sc > best.get(di, -1):
+                best[di] = sc
+        return sorted([(s, i) for i, s in best.items()], key=lambda x: -x[0])[:int(top)]
+
+
+def warm(docs, embed_fn):
+    global _WARMING
+    _WARMING = True
+    try:
+        with _LOCK:
+            _ensure(docs, embed_fn)
+    finally:
+        _WARMING = False
+
+
+def ready():
+    return _STATE["index"] is not None

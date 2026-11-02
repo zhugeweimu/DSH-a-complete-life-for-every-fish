@@ -266,12 +266,31 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
     return {"q": q, "mode": mode, "corpus": len(docs), "results": out}
 
 
+_WARM_LOCK = threading.Lock()
+
+
+def _warm_async():
+    """后台把向量索引追平；新写入不再等第一次查询才建索引。"""
+    def run():
+        if not _WARM_LOCK.acquire(blocking=False):
+            return
+        try:
+            import vector_store as VS
+            VS.warm(H.load_corpus(MEM_DB), H.embed)
+        except Exception as e:
+            print("vector warm failed: %r" % (e,))
+        finally:
+            _WARM_LOCK.release()
+    threading.Thread(target=run, daemon=True).start()
+
+
 def remember(title, content, person_id="", tags=None, importance=None, ts=None,
              origin="unknown", author="", source_event="", version=1):
     # 独立模式：不依赖任何平台，直接写本地库
     if os.environ.get("MEM_WRITE_MODE", "local") == "local":
         r = ST.add(title, content, person=person_id, tags=tags or [], importance=importance, ts=ts,
                    origin=origin, author=author, source_event=source_event, version=version, db=MEM_DB)
+        _warm_async()
         return {"ok": True, "id": r["id"], "merged": r["merged"], "mode": "local"}
     payload = {"title": (title or "无题")[:60], "content": content or "",
                "folder_id": "default", "bucket": "memory", "memory_type": "event",
@@ -565,6 +584,7 @@ class H2(BaseHTTPRequestHandler):
                                           d.get("person") or "", d.get("ts"), db=MEM_DB)
                     auto["enabled"] = True
                 r["auto_capture"] = auto
+                _warm_async()
                 return self._send(200, r)
             if self.path.startswith("/ingest"):
                 import autocapture as AC
@@ -629,6 +649,8 @@ def main():
     port = int(arg or os.environ.get("CORE_PORT") or 8095)
     _cleanup_flow()
     print("记忆内核 http://127.0.0.1:%d  mem_db=%s  graph_db=%s" % (port, MEM_DB, G.DB_PATH))
+
+    _warm_async()
     ThreadingHTTPServer(("127.0.0.1", port), H2).serve_forever()
 
 
