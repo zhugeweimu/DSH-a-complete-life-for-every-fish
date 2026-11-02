@@ -90,6 +90,13 @@ def _local_items(person_id="", limit=200, offset=0):
     sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
     args += [int(limit), int(offset)]
     rows = con.execute(sql, args).fetchall()
+    ids = [r["memory_id"] for r in rows]
+    tags = {}
+    if ids:
+        q = ("SELECT memory_id, tag_value FROM booku_memory_tags WHERE memory_id IN (%s)"
+             % ",".join("?" for _ in ids))
+        for tr in con.execute(q, ids):
+            tags.setdefault(tr["memory_id"], []).append(tr["tag_value"])
     con.close()
     return {"items": [{
         "id": r["memory_id"],
@@ -100,7 +107,7 @@ def _local_items(person_id="", limit=200, offset=0):
             "updated_at": r["updated_at"] or 0,
             "importance": r["importance"] or 0,
             "person_id": r["person_id"] or "",
-            "core_tags": [],
+            "core_tags": tags.get(r["memory_id"], []),
         },
     } for r in rows]}
 
@@ -379,6 +386,10 @@ def profile(person_id):
             out["features"] = json.loads(row[1] or "{}")
         except Exception:
             out["features"] = {}
+    try:
+        out["relations"] = G.current_relations(person_id)
+    except Exception:
+        out["relations"] = []
     return out
 
 
@@ -538,6 +549,13 @@ class H2(BaseHTTPRequestHandler):
                 import turnlog as TL
                 r = TL.append(d.get("person") or "", d.get("user") or "", d.get("reply") or "",
                               d.get("ts"), db=MEM_DB)
+                auto = {"enabled": False, "stored": []}
+                if os.environ.get("MEM_AUTOCAPTURE", "1") != "0":
+                    import autocapture as AC
+                    auto = AC.capture_turn(d.get("user") or "", d.get("reply") or "",
+                                          d.get("person") or "", d.get("ts"), db=MEM_DB)
+                    auto["enabled"] = True
+                r["auto_capture"] = auto
                 return self._send(200, r)
             if self.path.startswith("/ingest"):
                 import autocapture as AC

@@ -33,7 +33,7 @@ memory-core/
 │  ├─ memory_core.py      统一服务：/health /recall /remember /ingest /relation /why /profile
 │  ├─ store.py            独立写入：库调用/去重/合并
 │  ├─ turnlog.py          日志层：每回合追加 + 30 分钟会话分段 + 会话事件
-│  ├─ autocapture.py      自动抽取：普通对话也能落事件（fact/preference/plan/promise/relationship/event/note）
+│  ├─ autocapture.py      自动抽取：普通对话也能落事件（fact/preference/plan/promise/relationship/event/note）；默认由 `/log` 触发，`MEM_AUTOCAPTURE=0` 可关闭，宿主也可自行调 `/ingest` 完全自定义
 │  ├─ store_cli.py        写入命令行：add/batch/ingest/turns/list/show
 │  ├─ hybrid.py           BM25 + 向量 + RRF + 语料加载
 │  ├─ reranker_onnx.py    ONNX 交叉编码器重排（可选）
@@ -68,6 +68,7 @@ MEM_DB=./data/metadata.db python src/memory_core.py 8095
 | `MEM_DB` | `./data/metadata.db` | 记忆库路径 |
 | `MEM_WRITE_MODE` | `local` | `local` 直接写 SQLite；`auto` 仅兼容旧版 8001 |
 | `MEM_INBOX` | 空 | 仅 `MEM_WRITE_MODE=auto` 时使用的旧端点 |
+| `MEM_AUTOCAPTURE` | `1` | `1` 让 `/log` 自动调用 autocapture；`0` 关闭，宿主可自行调 `/ingest` |
 | `GRAPH_DIR` | `./data/graph` | 图谱数据目录 |
 | `EMBED_URL` | `http://127.0.0.1:8081/v1/embeddings` | 向量服务（可选） |
 | `RERANK_MODEL` | 空 | ONNX 重排模型路径（可选） |
