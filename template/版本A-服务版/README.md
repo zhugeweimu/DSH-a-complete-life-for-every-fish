@@ -39,6 +39,13 @@ memory-core/
 │  ├─ vector_store.py     FAISS HNSW 粗筛 + 候选精确 cosine
 │  ├─ reranker_onnx.py    ONNX 交叉编码器重排（可选）
 │  ├─ retrieval_server.py 只管检索的轻量服务
+│  ├─ identity.py         身份层：别名 / 名字 / 旧前缀 → canonical person_id
+│  ├─ closeout_events.py  会话收尾：活跃 chat 事件超 30 分钟清零，日志不足则标 needs_review
+│  ├─ distill.py          对话→结论（本地小模型），只写规则、不写过程
+│  ├─ export_memories.py  导出 / 重放：memories.json + media/ + MANIFEST.json
+│  ├─ migrate_visibility.py  owner / visibility / deletable 三列迁移
+│  ├─ migrate_event_links.py 事件关联回填
+│  ├─ migrate_taskj.py    旧任务记录 → turn_logs 会话窗口
 │  └─ graph_server.py     实体 / 关系 / 事件图谱
 └─ tests/
    ├─ test_schema.py
@@ -74,6 +81,36 @@ MEM_DB=./data/metadata.db python src/memory_core.py 8095
 | `VECTOR_DIR` | `./data` | FAISS 索引 / 向量 / id 映射目录 |
 | `EMBED_URL` | `http://127.0.0.1:8081/v1/embeddings` | 向量服务；启用 FAISS 时必需 |
 | `RERANK_MODEL` | 空 | ONNX 重排模型路径（可选） |
+| `MEM_IDENTITY_JSON` | `./data/identity.json` | 身份与别名表（见下节）；文件不存在则全部按原值处理 |
+
+## 身份与别名（identity）
+
+人不止一个名字：QQ 号、显示名、`agent:xxx`、旧前缀都指向同一个人。
+`identity.py` 把这层收在一处，`memory_core.py` 的 `CANONICAL` / `USER_PERSON` / `ALIASES`
+全部从同一个文件读，不在代码里写死。
+
+```bash
+cp identity.example.json data/identity.json
+```
+
+```json
+{
+  "canonical": "self:assistant",
+  "user": "user:qq:0000000000",
+  "alias_map": {
+    "qq:0000000000": "user:qq:0000000000",
+    "agent:assistant": "self:assistant",
+    "self:me": "self:assistant"
+  }
+}
+```
+
+- `canonical`：自己这一侧的 canonical id，形如 `self:<名字>`；末段名字用于对话包装（「<名字>说：」）。
+- `user`：默认对面那个人。
+- `alias_map`：别名 → canonical，启动时以 kind=`seed` 灌进 `person_aliases` 表（`INSERT OR IGNORE`，不覆盖手工加的）。
+  运行期也能用 `identity.add_alias()` 增补，落表即可。
+
+文件里没有的真实映射就不该有；`data/` 属于本地私有，不进仓库。
 
 ## API（8095）
 

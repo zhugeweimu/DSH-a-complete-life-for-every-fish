@@ -1,0 +1,12 @@
+{
+  "_note": "复制成 data/identity.json 再改。canonical 是「我」的 id，user 是对面那个人的 id，alias_map 是各种写法 → 规范 id。代码读不到这份文件也能跑，只是别名不展开。",
+  "canonical": "self:assistant",
+  "user": "user:qq:0000000000",
+  "alias_map": {
+    "assistant": "self:assistant",
+    "me": "self:assistant",
+    "self:assistant": "self:assistant",
+    "qq:0000000000": "user:qq:0000000000",
+    "0000000000": "user:qq:0000000000"
+  }
+}

@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import sqlite3
 import sys
@@ -30,6 +31,8 @@ import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import identity as IDENT
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -41,11 +44,100 @@ import reranker_onnx as R               # noqa: E402
 import graph_server as G                # noqa: E402
 import store as ST
 import consolidate as CO
+import distill as DL                    # noqa: E402
 
-MEM_DB = os.environ.get("MEM_DB") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "metadata.db")
-MEM_INBOX = os.environ.get("MEM_INBOX", "")
+_default_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "metadata.db")
+_alt_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "mu-memory", "data", "booku_memory", "metadata.db")
+
+
+def _pick_mem_db():
+    """P1-3：默认 0 字节库已停用。只接受显式 MEM_DB 或有效的 mu-memory 库；
+    解析不到就 fail-fast，绝不自动建空库。"""
+    env = os.environ.get("MEM_DB", "").strip()
+    if env:
+        p = os.path.abspath(env)
+        if os.path.isdir(p) or not os.path.exists(p) or os.path.getsize(p) <= 0:
+            raise SystemExit("MEM_DB 不可用（目录/不存在/0 字节）：%s" % p)
+        return p
+    if os.path.isfile(_alt_db) and os.path.getsize(_alt_db) > 0:
+        return os.path.abspath(_alt_db)
+    raise SystemExit(
+        "找不到可用记忆库：MEM_DB 未设置，且 %s 不存在或为 0 字节。"
+        "请显式设置 MEM_DB（默认库已停用，不会自动建空库）。" % _alt_db)
+
+
+MEM_DB = _pick_mem_db()
+MEM_INBOX = os.environ.get("MEM_INBOX", "")  # 默认空：本地模式不再默认回落 8001（8001 已停用）
+
+# 身份/别名属于本地私有数据，不进仓库：读 data/identity.json，
+# 可用 MEM_IDENTITY_JSON 覆盖。文件缺失时用中性默认值，不崩。
+IDENTITY_JSON = os.environ.get("MEM_IDENTITY_JSON") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "identity.json")
+
+
+def _load_identity():
+    try:
+        with open(IDENTITY_JSON, encoding="utf-8") as fp:
+            doc = json.load(fp)
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+_IDENT_DOC = _load_identity()
+CANONICAL = str(_IDENT_DOC.get("canonical") or "").strip() or "self:assistant"
+SELF_NAME = CANONICAL.split(":", 1)[-1].strip()
+USER_PERSON = str(_IDENT_DOC.get("user") or "").strip()
+ALIASES = {str(k).strip(): str(v).strip()
+           for k, v in (_IDENT_DOC.get("alias_map") or {}).items() if k and v}
+SCHEMA_VERSION = "mumu-memory/2"
 _lock = threading.Lock()
 _idx = {}
+
+# 并发准入：2026-11-21 事故里 871 个请求线程同时卡在 embed 上，把整机提交内存打满。
+# 现在同时最多处理 MEM_MAX_INFLIGHT 个请求，超出的直接 503，线程立刻退出。
+_MAX_INFLIGHT = max(1, int(os.environ.get("MEM_MAX_INFLIGHT") or 24))
+_INFLIGHT = threading.BoundedSemaphore(_MAX_INFLIGHT)
+_HTTP_TIMEOUT = int(os.environ.get("MEM_HTTP_TIMEOUT") or 60)
+
+
+def _private_token():
+    return os.environ.get("MEM_PRIVATE_TOKEN", "")
+
+
+def _can_private(headers):
+    """私有分区开关：未配置令牌时一律拒绝（fail-closed）。"""
+    tok = _private_token()
+    return bool(tok) and (headers or {}).get("X-MEM-Private-Token") == tok
+
+
+def _visible(d, include_private=False, owner=""):
+    """private 记录默认对所有读取路径不可见。"""
+    if (d.get("visibility") or "shared") != "private":
+        return True
+    if not include_private:
+        return False
+    return not owner or (d.get("owner") or "") == owner
+
+
+def _canon_person(person):
+    p = str(person or "").strip()
+    try:
+        return IDENT.canonical(p, MEM_DB) or ALIASES.get(p, p or CANONICAL)
+    except Exception:
+        return ALIASES.get(p, p or CANONICAL)
+
+
+def _init_identity():
+    con = sqlite3.connect(MEM_DB, timeout=10)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS person_aliases "
+                    "(alias TEXT PRIMARY KEY, canonical TEXT NOT NULL)")
+        for a, c in ALIASES.items():
+            con.execute("INSERT OR REPLACE INTO person_aliases(alias,canonical) VALUES(?,?)", (a, c))
+        con.commit()
+    finally:
+        con.close()
 
 
 def _db_sig():
@@ -77,12 +169,15 @@ def _index():
         return _idx
 
 
-
 def _local_items(person_id="", limit=200, offset=0):
+    person_id = _canon_person(person_id) if person_id else ""
     con = sqlite3.connect(MEM_DB, timeout=10)
     con.row_factory = sqlite3.Row
+    cols = {r[1] for r in con.execute("PRAGMA table_info(booku_memory_records)")}
+    priv = " AND COALESCE(visibility,'shared')<>'private'" if "visibility" in cols else ""
+    arch = " AND COALESCE(is_archived,0)=0" if "is_archived" in cols else ""
     sql = ("SELECT memory_id, title, content, person_id, created_at, updated_at, importance "
-           "FROM booku_memory_records WHERE COALESCE(is_deleted,0)=0")
+           "FROM booku_memory_records WHERE COALESCE(is_deleted,0)=0" + arch + priv)
     args = []
     if person_id:
         sql += " AND person_id=?"
@@ -113,7 +208,7 @@ def _local_items(person_id="", limit=200, offset=0):
 
 
 def _get(url, timeout=20):
-    # 本地模式：/booku-memory/api/memories 由本地 SQLite 承担，不访问 8001
+    # 本地模式：/booku-memory/api/memories 已由本地 SQLite 承担，不再访问 8001
     if "/booku-memory/api/memories" in url:
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
         person = (qs.get("person_id") or [""])[0]
@@ -181,7 +276,12 @@ def _cleanup_flow():
         pass
 
 
-def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=None, namespace="chat"):
+def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=None, namespace=None,
+           include_private=False, owner=""):
+    # namespace 不显式给时按环境变量兜底：8095 默认 chat，8097 设的是 dsh。
+    # 原实现硬写 "chat"，拷到 8097 会把 dsh 盖掉。
+    if not namespace:
+        namespace = os.environ.get("MEM_DEFAULT_NAMESPACE", "chat")
     ent = _index()
     all_docs = ent["docs"]
     bm_all = ent["bm"]
@@ -196,6 +296,8 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
         if namespace and namespace != "all" and (d.get("namespace") or "chat") != namespace:
             continue
         if allow is not None and ST.canon_person(d.get("person")) not in allow:
+            continue
+        if not _visible(d, include_private, owner):
             continue
         if since and float(d.get("ts") or 0) < float(since):
             continue
@@ -226,6 +328,7 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
     bm = H.BM25(docs)
     lex = bm.search(q, top=50)
     dense = []
+    dense_err = ""
     try:
         pos = {str(d["id"]): i for i, d in enumerate(docs)}
         want = max(200, min(len(all_docs), int(top) * 30))
@@ -233,10 +336,19 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
             did = str(all_docs[ai]["id"])
             if did in pos:
                 dense.append((sc, pos[did]))
-    except Exception:
+    except Exception as e:
+        # 向量不可用就只走字面 + 轻量重排：不降级成"整库 embed"，也不报 500
         dense = []
+        dense_err = repr(e)
 
     fused = H.rrf([x for x in (lex, dense) if x])
+    # 实体/标签信号（Mem0 实体链接的最小版）：不建新表，直接用 core_tags
+    try:
+        ent = H.tag_match(docs, q)
+        if ent:
+            fused = H.rrf([x for x in (lex, dense, ent) if x])
+    except Exception:
+        pass
     if rerank == "bge":
         try:
             picked = R.rerank(q, docs, fused, top)
@@ -255,25 +367,34 @@ def recall(q, top=6, person="", scope="all", rerank="bge", since=None, until=Non
         d = docs[idx]
         imp = _importance(d.get("title"), d.get("importance"))
         dec = _decay(d.get("ts"), d.get("last_activated"), imp)
+        rec = H.recency_factor(d.get("ts"))
         out.append({"id": d["id"], "person": d.get("person") or "", "ts": d.get("ts") or 0,
                     "title": (d.get("title") or "")[:60],
                     "text": (d.get("text") or "")[:200],
-                    "score": round(float(sc) * dec, 4),
-                    "base": round(float(sc), 4), "decay": round(dec, 3), "importance": imp,
+                    "score": round(float(sc) * dec * rec, 4),
+                    "base": round(float(sc), 4), "decay": round(dec, 3),
+                    "recency": round(rec, 3), "importance": imp,
                     "why": why})
     out.sort(key=lambda x: -x["score"])
     top_score = out[0]["score"] if out else 0.0
     for x in out:
         x["score_norm"] = round(x["score"] / top_score, 4) if top_score else 0.0
         _bump(x["id"])
-    return {"q": q, "mode": mode, "corpus": len(docs), "results": out}
+    res = {"q": q, "mode": mode, "corpus": len(docs), "results": out}
+    if dense_err:
+        res["dense_error"] = dense_err
+    return res
 
 
 _WARM_LOCK = threading.Lock()
 
 
-def _warm_async():
-    """后台把向量索引追平；新写入不再等第一次查询才建索引。"""
+def _warm_async(retry_delay=60, attempts=6):
+    """后台把向量索引追平；新写入不再等第一次查询才建索引。
+
+    8081 暂时不可达时按 retry_delay 重试（有界次数）：既不放弃索引，
+    也不把重试压到请求线程上（请求路径只降级成字面检索）。
+    """
     import vector_store as _VS
     _VS._WARMING = True
 
@@ -282,31 +403,182 @@ def _warm_async():
             return
         try:
             import vector_store as VS
-            VS.warm(H.load_corpus(MEM_DB), H.embed)
-        except Exception as e:
-            print("vector warm failed: %r" % (e,))
+            for i in range(max(1, int(attempts))):
+                try:
+                    VS.warm(H.load_corpus(MEM_DB), H.embed)
+                    return
+                except Exception as e:
+                    print("vector warm failed (%d/%d): %r"
+                          % (i + 1, int(attempts), e), flush=True)
+                    if i + 1 < int(attempts):
+                        VS._WARMING = True     # 重试间隙也别让请求线程去建索引
+                        time.sleep(float(retry_delay))
         finally:
             _WARM_LOCK.release()
     threading.Thread(target=run, daemon=True).start()
 
 
+# ---------- 8001 booku-memory 兼容层（CE 等旧客户端；内部转 store/recall） ----------
+def booku_search(q, limit=5, person="", namespace="all"):
+    """GET/POST /booku-memory/api/search → 本地 recall，返回 {items:[...]}。"""
+    try:
+        limit = max(1, min(200, int(limit or 5)))
+    except Exception:
+        limit = 5
+    r = recall(q or "", top=limit, person=person or "", scope="all", rerank="light",
+               namespace=namespace or "all")
+    items = []
+    for x in r.get("results") or []:
+        txt = x.get("text") or ""
+        items.append({"id": x.get("id") or "", "title": x.get("title") or "",
+                      "content": txt, "text": txt, "source": x.get("id") or "memory-core",
+                      "person_id": x.get("person") or "", "created_at": x.get("ts") or 0,
+                      "score": x.get("score")})
+    return {"items": items, "total": len(items), "mode": r.get("mode"), "q": q}
+
+
+_TURN_MARK = re.compile(r"\[(?:桌|查|读|记|归|搜笔|读笔|日|地图|网|网链|网搜|搜网)[:：][^\]]*\]")
+_TURN_SYS = re.compile(r"^\s*(?:系统|system|指令|instruction|提示词)\s*[:：]", re.I)
+
+
+def _clean_turn(text):
+    """过滤工具标记/系统提示行；只留下可给人看的对话文本。"""
+    out = []
+    for line in str(text or "").splitlines():
+        if _TURN_SYS.match(line):
+            continue
+        line = _TURN_MARK.sub("", line).strip()
+        if line:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def turns(person="", limit=20):
+    """本地 turn_logs → 正序 user/assistant 轮次（limit 上限 20）。
+
+    返回 {"person","limit","turns":[{"role","text","ts","session_id"}]}；无记录返回空列表。
+    """
+    try:
+        limit = max(1, min(20, int(limit or 20)))
+    except Exception:
+        limit = 20
+    raw = (person or "").strip()
+    p = ST.canon_person(raw)
+    cands = [x for x in dict.fromkeys([raw, p, p[5:] if p.startswith("user:") else "",
+                                       raw[5:] if raw.startswith("user:") else ""]) if x]
+    con = sqlite3.connect(MEM_DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        # 别名跨通道：工作台的 dashboard 账号归到主人 QQ（旧库可能没有该表，容忍）
+        try:
+            for c in list(cands):
+                row = con.execute(
+                    "SELECT canonical FROM person_aliases WHERE alias=?", (c,)
+                ).fetchone()
+                if row and row[0]:
+                    for v in (row[0], row[0][5:] if row[0].startswith("user:") else ""):
+                        if v and v not in cands:
+                            cands.append(v)
+        except sqlite3.OperationalError:
+            pass
+        q = ("SELECT id,ts,user_text,reply_text,session_id FROM turn_logs "
+             "WHERE person IN (%s) ORDER BY ts DESC, id DESC LIMIT ?"
+             % ",".join("?" for _ in cands)) if cands else ""
+        rows = con.execute(q, cands + [limit]).fetchall() if cands else []
+    finally:
+        con.close()
+    out = []
+    for r in reversed(rows):
+        for role, txt in (("user", _clean_turn(r["user_text"])),
+                          ("assistant", _clean_turn(r["reply_text"]))):
+            if not txt:
+                continue
+            item = {"role": role, "text": txt, "ts": r["ts"] or 0,
+                    "session_id": r["session_id"] or ""}
+            if out and out[-1]["role"] == role:
+                out[-1] = item          # 连续同角色：保留最新一条，保证交替
+            else:
+                out.append(item)
+    while out and out[0]["role"] != "user":
+        out.pop(0)
+    return {"person": p, "limit": limit, "turns": out}
+
+
+def booku_list(limit=200, offset=0, person="", folder=""):
+    """GET /booku-memory/api/memories → 列表（默认不含 private）。"""
+    con = sqlite3.connect(MEM_DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    cols = {r[1] for r in con.execute("PRAGMA table_info(booku_memory_records)")}
+    priv = " AND COALESCE(visibility,'shared')<>'private'" if "visibility" in cols else ""
+    where, args = ["COALESCE(is_deleted,0)=0" + priv], []
+    if person:
+        where.append("person_id=?")
+        args.append(person)
+    if folder:
+        where.append("folder_id=?")
+        args.append(folder)
+    w = " WHERE " + " AND ".join(where)
+    total = con.execute("SELECT COUNT(*) FROM booku_memory_records" + w, args).fetchone()[0]
+    rows = con.execute(
+        "SELECT memory_id, title, content, person_id, folder_id, created_at, updated_at, "
+        "importance, namespace FROM booku_memory_records" + w +
+        " ORDER BY created_at DESC LIMIT ? OFFSET ?", args + [int(limit), int(offset)]).fetchall()
+    con.close()
+    items = [{"id": r["memory_id"], "title": r["title"] or "",
+              "content": r["content"] or "", "content_snippet": (r["content"] or "")[:240],
+              "text": r["content"] or "", "person_id": r["person_id"] or "",
+              "folder_id": r["folder_id"] or "", "created_at": r["created_at"] or 0,
+              "updated_at": r["updated_at"] or 0, "importance": r["importance"],
+              "namespace": r["namespace"] or "chat"} for r in rows]
+    return {"items": items, "total": int(total)}
+
+
+def booku_remember(d):
+    """POST /booku-memory/api/memories（booku 形状）→ 本地 remember。"""
+    tags = list(d.get("core_tags") or []) + list(d.get("diffusion_tags") or [])
+    bucket = str(d.get("bucket") or "")
+    ns = d.get("namespace") or ("game" if bucket == "game" else "chat")
+    r = remember(d.get("title") or "", d.get("content") or d.get("text") or "",
+                 d.get("person_id") or d.get("person") or "", tags,
+                 importance=d.get("importance"), namespace=ns,
+                 folder=d.get("folder_id") or "")
+    return {"id": r.get("id") or "", "success": bool(r.get("ok")),
+            "merged": r.get("merged"), "mode": r.get("mode"),
+            "item": {"id": r.get("id") or "", "title": d.get("title") or "",
+                     "folder_id": d.get("folder_id") or "", "status": "active"}}
+
+
 def remember(title, content, person_id="", tags=None, importance=None, ts=None,
-             origin="unknown", author="", source_event="", version=1, namespace="chat"):
+             origin="unknown", author="", source_event="", version=1, namespace="chat",
+             owner="", visibility="shared", deletable=1, folder=""):
+    orig = str(person_id or "")
+    person_id = _canon_person(orig)
+    if not author:
+        author = "user" if orig.startswith("qq:") else (SELF_NAME if orig.startswith("agent:") else "")
+    if origin == "unknown":
+        origin = "chat" if orig.startswith("qq:") else ("game" if orig.startswith("agent:") else "unknown")
     # 独立模式：不依赖任何平台，直接写本地库
     if os.environ.get("MEM_WRITE_MODE", "local") == "local":
         r = ST.add(title, content, person=person_id, tags=tags or [], importance=importance, ts=ts,
                    origin=origin, author=author, source_event=source_event, version=version,
-                   db=MEM_DB, namespace=namespace)
+                   db=MEM_DB, namespace=namespace, owner=owner, visibility=visibility,
+                   deletable=deletable, folder=folder)
         _warm_async()
-        return {"ok": True, "id": r["id"], "merged": r["merged"], "mode": "local"}
+        return {"ok": True, "id": r["id"], "merged": r["merged"],
+                "revived": bool(r.get("revived")), "kind": r.get("kind") or "",
+                "mode": "local"}
+    if not MEM_INBOX:
+        return {"ok": False, "mode": "inbox-unconfigured",
+                "error": "MEM_INBOX 未配置：MEM_WRITE_MODE 非 local 时必须显式提供兼容地址（8001 已停用，不再默认回落）"}
     payload = {"title": (title or "无题")[:60], "content": content or "",
                "folder_id": "default", "bucket": "memory", "memory_type": "event",
                "status": "active", "person_id": person_id,
                "namespace": namespace or "chat",
                "core_tags": tags or ["对话"], "diffusion_tags": ["core"],
                "opposing_tags": ["未分类"],
-        "origin": d.get("origin", "unknown"), "author": d.get("author", ""),
-        "source_event": d.get("source_event", ""), "version": int(d.get("version") or 1)}
+        "origin": origin, "author": author,
+        "source_event": source_event, "version": int(version or 1),
+        "owner": owner, "visibility": visibility, "deletable": int(deletable)}
     if ts:
         payload["ts"] = float(ts)
         payload["created_at"] = float(ts)
@@ -404,6 +676,7 @@ def profile(person_id):
     out = {"impression": "", "attitude": "", "name": "", "features": {},
            "impression_ts": 0, "attitude_ts": 0}
     try:
+        # 本地优先：直接查本地库的 印象/态度 标签，不依赖 MEM_INBOX / 已停用的 8001
         d = _local_items(person_id, 200)
         for it in d.get("items") or []:
             md = it.get("metadata") or {}
@@ -511,13 +784,75 @@ health();setInterval(health,15000);
 </script></body></html>"""
 
 class H2(BaseHTTPRequestHandler):
+    timeout = _HTTP_TIMEOUT          # 客户端不发完整请求时，socket 读超时，线程不会永久挂住
+    protocol_version = "HTTP/1.0"
+    ADMIT_WAIT = float(os.environ.get("MEM_ADMIT_WAIT") or 3)
+
+    def _drain_request(self):
+        """读掉请求行/头/体，避免关连接时 RST 把 503 响应冲掉。"""
+        try:
+            self.connection.settimeout(1.0)
+            total, headers = 0, []
+            while total < (1 << 20):
+                line = self.rfile.readline(65537)
+                if not line:
+                    break
+                total += len(line)
+                if line in (b"\r\n", b"\n"):
+                    break
+                headers.append(line)
+            clen = 0
+            for h in headers:
+                if h.lower().startswith(b"content-length:"):
+                    try:
+                        clen = int(h.split(b":", 1)[1].strip())
+                    except Exception:
+                        clen = 0
+            if clen > 0:
+                self.rfile.read(min(clen, 1 << 20))
+        except Exception:
+            pass
+
+    def handle(self):
+        """并发准入：先等 MEM_ADMIT_WAIT 秒，还满就 503，不再无限起线程堆在 embed 上。"""
+        admitted = _INFLIGHT.acquire(blocking=False) or _INFLIGHT.acquire(timeout=self.ADMIT_WAIT)
+        if not admitted:
+            try:
+                self._drain_request()
+                b = json.dumps({"error": "too many concurrent requests",
+                                "inflight_max": _MAX_INFLIGHT}).encode("utf-8")
+                self.close_connection = True
+                self.wfile.write(b"HTTP/1.0 503 Service Unavailable\r\n"
+                                 b"Content-Type: application/json; charset=utf-8\r\n"
+                                 b"Content-Length: " + str(len(b)).encode() + b"\r\n"
+                                 b"Connection: close\r\n\r\n" + b)
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+        try:
+            super().handle()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # 客户端在「读请求行」阶段就被 RST 掉（healthz 探针、页面关掉、blockd 超时取消）。
+            # _send 只挡住了写响应那一半，读这一半会一路冒到 socketserver.handle_error，
+            # 每个探针堆一条 40 行栈 —— 2026-11-23 那 28204 行就是这么来的。
+            pass
+        finally:
+            _INFLIGHT.release()
+
     def _send(self, code, obj):
         b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # 客户端先断开了（blockd 的 /recall 超时取消、或页面关掉），写到一半
+            # 抛 WinError 10053 是对方的动作，不是这边的故障；别让它进错误日志，
+            # 否则每次超时都往 err.log 里堆一条 40 行的栈。
+            pass
 
     def do_GET(self):
         try:
@@ -529,6 +864,13 @@ class H2(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b)
                 return
+            if self.path.startswith("/capabilities"):
+                return self._send(200, {
+                    "ok": True, "schema": SCHEMA_VERSION,
+                    "canonical_person": CANONICAL, "aliases": ALIASES,
+                    "view": ["chat", "game", ""],
+                    "private_enabled": bool(_private_token()),
+                })
             if self.path.startswith("/health"):
                 con = G._conn()
                 n = lambda t: con.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
@@ -536,7 +878,39 @@ class H2(BaseHTTPRequestHandler):
                        "relations": n("relations"), "events": n("events"),
                        "mem_db": MEM_DB, "graph_db": G.DB_PATH}
                 con.close()
+                try:
+                    import vector_store as _VS
+                    out["vectors"] = {
+                        "ready": bool(_VS.ready()),
+                        "build_cooldown_s": round(max(0.0, _VS._BUILD_COOL["until"] - time.time()), 1),
+                        "last_build_error": _VS._BUILD_COOL["err"] or "",
+                    }
+                except Exception as e:
+                    out["vectors"] = {"ready": False, "error": repr(e)}
+                out["embed"] = {"url": H.EMB_URL,
+                                "circuit_open": bool(H._circuit_open()),
+                                "circuit_s": round(max(0.0, H._EMB_FAIL["until"] - time.time()), 1),
+                                "last_error": H._EMB_FAIL["err"] or ""}
+                out["inflight_max"] = _MAX_INFLIGHT
+                out["threads"] = threading.active_count()
                 return self._send(200, out)
+            if self.path.startswith("/booku-memory/api/search"):
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                p = {k: v[0] for k, v in qs.items()}
+                return self._send(200, booku_search(p.get("q") or "", p.get("limit") or 5,
+                                                    p.get("person_id") or p.get("person") or "",
+                                                    p.get("namespace") or "all"))
+            if self.path.startswith("/booku-memory/api/memories"):
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                p = {k: v[0] for k, v in qs.items()}
+                return self._send(200, booku_list(int(p.get("limit") or 200),
+                                                  int(p.get("offset") or 0),
+                                                  p.get("person_id") or p.get("person") or "",
+                                                  p.get("folder_id") or ""))
+            if self.path.startswith("/turns"):
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                p = {k: v[0] for k, v in qs.items()}
+                return self._send(200, turns(p.get("person") or "", p.get("limit") or 20))
             if self.path.startswith("/list"):
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 params = {k: v[0] for k, v in qs.items()}
@@ -560,11 +934,15 @@ class H2(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             d = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
             if self.path.startswith("/recall"):
+                can_priv = _can_private(self.headers)
+                owner_q = d.get("owner") or d.get("person") or ""
                 return self._send(200, recall(d.get("q") or "", int(d.get("top") or 6),
                                               d.get("person") or "", d.get("scope") or "all",
                                               d.get("rerank") or "bge",
                                               since=d.get("since"), until=d.get("until"),
-                                              namespace=d.get("namespace") or "chat"))
+                                              namespace=d.get("namespace") or "chat",
+                                              include_private=bool(d.get("include_private")) and can_priv,
+                                              owner=owner_q if can_priv else ""))
             if self.path.startswith("/consolidate"):
                 return self._send(200, CO.run(db=MEM_DB,
                                              archive_days=int(d.get("archive_days") or 30),
@@ -577,13 +955,21 @@ class H2(BaseHTTPRequestHandler):
                 return self._send(200, DE.run(db=MEM_DB))
             if self.path.startswith("/context"):
                 import context as CX
+                can_priv = _can_private(self.headers)
                 return self._send(200, CX.build(
                     d.get("person") or "", d.get("q") or "",
                     int(d.get("top") or 5), int(d.get("max_chars") or 1200), db=MEM_DB,
                     include_self=bool(d.get("include_self")),
                     diary_days=int(d.get("diary_days") or 0),
                     min_score=float(d.get("min_score") or 0),
-                    namespace=d.get("namespace") or "chat"))
+                    namespace=d.get("namespace") or "chat",
+                    include_private=bool(d.get("include_private")) and can_priv,
+                    # 只给 QQ 要「眼前」：DSH 那边能自己查，不需要塞注入包
+                    eyes=bool(d.get("eyes")),
+                    # 记忆块第五段（blockd 8099）：默认开，body {"blocks":0} 可关（A/B 用）
+                    use_blocks=bool(d.get("blocks", 1)),
+                    blocks_agent=d.get("blocks_agent") or "",
+                    owner=(d.get("owner") or d.get("person") or "") if can_priv else ""))
             if self.path.startswith("/log"):
                 import turnlog as TL
                 r = TL.append(d.get("person") or "", d.get("user") or "", d.get("reply") or "",
@@ -612,11 +998,77 @@ class H2(BaseHTTPRequestHandler):
                              importance=d.get("importance"),
                              namespace=d.get("namespace") or ("game" if str(kind).startswith("游戏") else "chat"))
                 return self._send(200, {"ok": True, "id": r.get("id") or "", "kind": kind})
+            if self.path.startswith("/booku-memory/api/memories"):
+                return self._send(200, booku_remember(d))
+            if self.path.startswith("/booku-memory/api/search"):
+                return self._send(200, booku_search(d.get("q") or "", d.get("limit") or 5,
+                                                    d.get("person_id") or d.get("person") or "",
+                                                    d.get("namespace") or "all"))
+            if self.path.startswith("/emotion"):
+                mid = str(d.get("memory_id") or "").strip()
+                axes = d.get("axes") or {}
+                if not mid:
+                    return self._send(400, {"error": "memory_id required"})
+                try:
+                    con = sqlite3.connect(MEM_DB, timeout=10)
+                    con.execute("CREATE TABLE IF NOT EXISTS booku_memory_emotions("
+                                "memory_id TEXT PRIMARY KEY, axes_json TEXT, ts REAL, source TEXT)")
+                    con.execute("INSERT INTO booku_memory_emotions(memory_id,axes_json,ts,source) "
+                                "VALUES(?,?,?,?) ON CONFLICT(memory_id) DO UPDATE SET "
+                                "axes_json=excluded.axes_json,ts=excluded.ts,source=excluded.source",
+                                (mid, json.dumps(axes, ensure_ascii=False),
+                                 float(d.get("ts") or time.time()), str(d.get("source") or "avm")))
+                    con.commit()
+                    con.close()
+                    return self._send(200, {"ok": True, "memory_id": mid})
+                except Exception as e:
+                    return self._send(500, {"error": repr(e)})
+            if self.path.startswith("/conclude"):
+                txt = str(d.get("text") or "").strip()
+                if not txt:
+                    return self._send(400, {"error": "text 必填"})
+                j = DL.judge(txt)
+                if not j.get("ok"):
+                    return self._send(200, {"ok": False, "conclusions": [],
+                                            "error": j.get("error")})
+                rules = j.get("rules") or []
+                if not rules:
+                    return self._send(200, {"ok": True, "conclusions": [],
+                                            "raw": j.get("raw") or ""})
+                pid = _canon_person(str(d.get("person_id") or ""))
+                ns = str(d.get("namespace") or "chat")
+                dry = bool(d.get("dry_run"))
+                saved = []
+                for rule in rules:
+                    dup = DL.find_similar(rule, MEM_DB, ns)
+                    if dup:
+                        saved.append({"rule": rule, "dup_of": dup, "skipped": True})
+                        continue
+                    if dry:
+                        saved.append({"rule": rule, "dry_run": True})
+                        continue
+                    r = ST.add("结论·" + rule[:40], rule, person=pid, tags=["结论"],
+                               memory_type="conclusion", db=MEM_DB, namespace=ns,
+                               origin="chat", author=SELF_NAME)
+                    saved.append({"id": r.get("id"), "rule": rule,
+                                  "merged": r.get("merged"), "dup_id": r.get("dup_id")})
+                return self._send(200, {"ok": True, "conclusions": saved,
+                                        "raw": j.get("raw") or ""})
             if self.path.startswith("/remember"):
+                vis = str(d.get("visibility") or "shared").strip().lower()
+                owner_in = str(d.get("owner") or d.get("person_id") or "").strip()
+                if vis not in ST.VISIBILITIES:
+                    return self._send(400, {"error": "visibility 只能是 shared 或 private"})
+                if vis == "private" and not _can_private(self.headers):
+                    return self._send(403, {"error": "写 private 需要 X-MEM-Private-Token",
+                                            "refused": "private"})
                 return self._send(200, remember(d.get("title"), d.get("content"),
                                                 d.get("person_id") or "", d.get("tags"),
                                                 importance=d.get("importance"),
-                                                namespace=d.get("namespace") or "chat"))
+                                                namespace=d.get("namespace") or "chat",
+                                                owner=owner_in if vis == "private" else "",
+                                                visibility=vis,
+                                                deletable=d.get("deletable", 1)))
             if self.path.startswith("/relation"):
                 r = G.add_relation(d.get("subject") or "", d.get("predicate") or "",
                                    d.get("object") or "", d.get("note") or "",
@@ -649,22 +1101,69 @@ class H2(BaseHTTPRequestHandler):
                     con.commit()
                     con.close()
                 return self._send(200, {"ok": True, "id": uid})
+            if self.path.startswith("/export"):
+                can_priv = _can_private(self.headers)
+                out = ST.export(db=MEM_DB, out_dir=os.path.join(HERE, "..", "data", "backup"),
+                                include_private=bool(d.get("include_private")) and can_priv,
+                                tag=str(d.get("tag") or "api"))
+                return self._send(200, out)
             return self._send(404, {"error": "not found"})
+        except PermissionError as e:
+            self._send(403, {"error": str(e), "refused": "private"})
+        except KeyError as e:
+            self._send(404, {"error": str(e)})
         except Exception as e:
             self._send(500, {"error": repr(e)})
+
+    def do_DELETE(self):
+        try:
+            p = urllib.parse.urlparse(self.path)
+            if not p.path.startswith("/memories/"):
+                return self._send(404, {"error": "not found"})
+            mid = p.path.split("/memories/", 1)[1].strip("/")
+            actor = "self" if _can_private(self.headers) else "user"
+            return self._send(200, ST.soft_delete(mid, actor=actor, db=MEM_DB))
+        except PermissionError as e:
+            self._send(403, {"error": str(e), "refused": "private"})
+        except KeyError as e:
+            self._send(404, {"error": str(e)})
+        except Exception as e:
+            self._send(500, {"error": repr(e)})
+
+    def do_PUT(self):
+        self._send(405, {"error": "没有修改接口：记忆只做新增/合并；private 记录用户侧不可改"})
+
+    def do_PATCH(self):
+        self._send(405, {"error": "没有修改接口：记忆只做新增/合并；private 记录用户侧不可改"})
 
     def log_message(self, *a):
         pass
 
 
+class CoreServer(ThreadingHTTPServer):
+    """连接队列默认太短（5），突发并发时客户端会直接 connection refused。"""
+    daemon_threads = True
+    request_queue_size = max(8, int(os.environ.get("MEM_BACKLOG") or 128))
+
+    def handle_error(self, request, client_address):
+        # 兜底：客户端半路走人（10053 中止 / 10054 重置 / 10058 已关闭）是对方的动作，
+        # 不是这边的故障，不该变成日志里一条 40 行的栈。真异常照旧交给 socketserver。
+        if isinstance(sys.exc_info()[1],
+                      (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].isdigit() else ""
     port = int(arg or os.environ.get("CORE_PORT") or 8095)
+    _init_identity()
     _cleanup_flow()
     print("记忆内核 http://127.0.0.1:%d  mem_db=%s  graph_db=%s" % (port, MEM_DB, G.DB_PATH))
-
+    print("嵌入端点 %s · 并发上限 %d · embed 截止 %.0fs"
+          % (H.EMB_URL, _MAX_INFLIGHT, H._EMB_DEADLINE), flush=True)
     _warm_async()
-    ThreadingHTTPServer(("127.0.0.1", port), H2).serve_forever()
+    CoreServer(("127.0.0.1", port), H2).serve_forever()
 
 
 if __name__ == "__main__":

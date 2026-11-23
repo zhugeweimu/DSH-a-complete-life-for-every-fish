@@ -84,7 +84,7 @@ def main():
             "insert or replace into event_records"
             "(id,person,start_ts,end_ts,summary,event_type,importance,weight,source_log_ids,legacy,is_archived) "
             "values(?,?,?,?,?,?,?,?,?,1,0)",
-            ("legacy-" + d["memory_id"], d.get("person_id") or "qq:3665613142",
+            ("legacy-" + d["memory_id"], d.get("person_id") or "",
              d.get("created_at") or 0, d.get("created_at") or 0,
              (d.get("title") or "") + "\n" + (d.get("content") or ""),
              d.get("memory_type") or "event", float(d.get("importance") or 0.3), 0.35, ""))

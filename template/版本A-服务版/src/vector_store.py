@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 
 import numpy as np
 
@@ -23,6 +24,10 @@ except Exception:  # pragma: no cover
 _LOCK = threading.Lock()
 _WARMING = False
 _STATE = {"chunks": {}, "ids": [], "vecs": None, "index": None, "dim": 0, "doc_map": {}}
+# 建索引失败后的冷却：8081 挂掉时，别让每个请求都重试一次整库 embed。
+_BUILD_COOL = {"until": 0.0, "err": ""}
+_BUILD_COOL_SECONDS = float(os.environ.get("VECTOR_BUILD_COOLDOWN") or 60)
+EMBED_BATCH = int(os.environ.get("VECTOR_EMBED_BATCH") or 64)
 
 VECTOR_DIR = os.path.abspath(os.environ.get(
     "VECTOR_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")))
@@ -81,11 +86,20 @@ def _save(index, vecs, ids, meta):
     os.replace(META_PATH + ".tmp", META_PATH)
 
 
+def _embed_batched(embed_fn, texts):
+    """分批 embed：单次调用有截止时间，几千块也不会一次卡死、失败也不白跑前面。"""
+    texts = list(texts)
+    out = []
+    for i in range(0, len(texts), max(1, EMBED_BATCH)):
+        out.extend(embed_fn(texts[i:i + max(1, EMBED_BATCH)]))
+    return out
+
+
 def _build(docs, embed_fn):
     chunks = _collect(docs)
     if not chunks:
         raise RuntimeError("没有可索引内容")
-    vecs = _norm(embed_fn([c[2] for c in chunks]))
+    vecs = _norm(_embed_batched(embed_fn, [c[2] for c in chunks]))
     index = faiss.IndexHNSWFlat(int(vecs.shape[1]), 32, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = 200
     index.add(vecs)
@@ -139,7 +153,7 @@ def _ensure(docs, embed_fn):
             # 旧块标墓碑；新块直接加
             pass
         if added:
-            nv = _norm(embed_fn([c[2] for c in added]))
+            nv = _norm(_embed_batched(embed_fn, [c[2] for c in added]))
             index.add(nv)
             vecs = np.vstack([vecs, nv])
             ids += [c[0] for c in added]
@@ -175,9 +189,18 @@ def search(docs, q, embed_fn, top=80):
     """返回 [(exact_cosine, doc_index), ...]；分块命中后按记忆去重。"""
     if _STATE["index"] is None and _WARMING:
         raise RuntimeError("向量索引正在后台构建")
-    with _LOCK:
-        _ensure(docs, embed_fn)
-        tombs = _tombstones()
+    if _STATE["index"] is None and time.time() < _BUILD_COOL["until"]:
+        raise RuntimeError("向量索引构建失败冷却中（剩 %.0fs）：%s"
+                           % (_BUILD_COOL["until"] - time.time(), _BUILD_COOL["err"]))
+    try:
+        with _LOCK:
+            _ensure(docs, embed_fn)
+            tombs = _tombstones()
+    except Exception as e:
+        if _STATE["index"] is None:
+            _BUILD_COOL.update({"until": time.time() + _BUILD_COOL_SECONDS,
+                                "err": repr(e)})
+        raise
     # query embedding 不占索引锁，4 路并发在这里生效
     qv = _norm(embed_fn([q]))[0]
     with _LOCK:
@@ -211,6 +234,10 @@ def warm(docs, embed_fn):
     try:
         with _LOCK:
             _ensure(docs, embed_fn)
+        _BUILD_COOL.update({"until": 0.0, "err": ""})
+    except Exception as e:
+        _BUILD_COOL.update({"until": time.time() + _BUILD_COOL_SECONDS, "err": repr(e)})
+        raise
     finally:
         _WARMING = False
 

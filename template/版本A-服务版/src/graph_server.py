@@ -17,7 +17,7 @@
   POST /relation   写关系（subject/object 可以给 id 或名字；名字会解析成 id）
   POST /why        当前边 + 事件向量 top-k
   GET  /relations?entity=user:10001 或 ?name=某人
-  GET  /entities?q=三季
+  GET  /entities?q=张三
   GET  /health
 """
 from __future__ import annotations

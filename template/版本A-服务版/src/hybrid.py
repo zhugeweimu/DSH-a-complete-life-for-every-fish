@@ -19,9 +19,11 @@ import json
 import math
 import os
 import re
+import socket
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.request
 import threading
 
@@ -38,11 +40,20 @@ CJK = re.compile(r"[\u4e00-\u9fff]")
 def load_corpus(db_path):
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
+    cols = {r[1] for r in con.execute("PRAGMA table_info(booku_memory_records)")}
+    opt = "".join(
+        ", COALESCE(%s, %s) AS %s" % (c, d, c)
+        for c, d in (("namespace", "'chat'"), ("owner", "''"),
+                     ("visibility", "'shared'"), ("deletable", "1"))
+        if c in cols)
+    ns = ("namespace" if "namespace" in cols else "'chat' AS namespace")
+    # 老库可能没有 is_archived：按列存在与否拼条件，别让整条检索因为一个列失败
+    arch = "AND COALESCE(is_archived,0)=0" if "is_archived" in cols else ""
     rows = con.execute(
         "SELECT memory_id, title, content, folder_id, created_at, memory_type, person_id, "
           "COALESCE(last_activated_at,0) AS last_activated, "
-          "importance, namespace "
-        "FROM booku_memory_records WHERE is_deleted=0").fetchall()
+          "importance, " + ns + opt + " "
+        "FROM booku_memory_records WHERE is_deleted=0 " + arch).fetchall()
     tags = {}
     try:
         for r in con.execute("SELECT memory_id, tag_value FROM booku_memory_tags"):
@@ -62,12 +73,15 @@ def load_corpus(db_path):
             "importance": r["importance"],
             "namespace": (r["namespace"] if "namespace" in r.keys() else "chat") or "chat",
             "type": r["memory_type"] or "",
+            "owner": (r["owner"] if "owner" in r.keys() else "") or "",
+            "visibility": (r["visibility"] if "visibility" in r.keys() else "shared") or "shared",
+            "deletable": int(r["deletable"] if "deletable" in r.keys() else 1),
             "tags": tags.get(r["memory_id"], []),
         })
     try:
         for r in con.execute(
-            "SELECT id, person, start_ts, summary, event_type, importance, weight, legacy "
-            "FROM event_records WHERE is_archived=0"
+            "SELECT id, person, start_ts, summary, event_type, importance, weight, legacy, "
+            "COALESCE(namespace,'chat') AS namespace FROM event_records WHERE is_archived=0"
         ):
             summary = r["summary"] or ""
             docs.append({
@@ -79,7 +93,7 @@ def load_corpus(db_path):
                 "ts": r["start_ts"] or 0,
                 "last_activated": 0,
                 "importance": float(r["importance"] or r["weight"] or 0.5),
-                "namespace": "chat",
+                "namespace": r["namespace"] or "chat",
                 "type": r["event_type"] or "event",
                 "tags": ["事件", "旧记录" if r["legacy"] else "会话"],
             })
@@ -142,35 +156,82 @@ class BM25:
 
 
 # ---------------- 语义 ----------------
-def embed(texts):
-    """有界并发：最多 4 个请求同时打到 BGE，避免一次性压垮服务。"""
+# 有界嵌入：单例线程池 + 整体截止时间 + 熔断。
+# 2026-11-21 事故复盘：8081 BGE 挂掉后，每个 /recall 都在请求线程里把整库缺失向量
+# embed 一遍（4 worker × 每并发请求各一份整库文本），871 个请求线程累计 42GB 提交内存，
+# 把整机提交上限打满，DeepSeek Harness host 拿不到内存直接 0xE0000008 退出。
+# 现在的边界：一次 embed 调用最多等 EMBED_DEADLINE 秒；端点不可达即熔断，
+# 后续调用立即失败（不再每个线程各等一轮重试）。
+_EMB_POOL = None
+_EMB_POOL_LOCK = threading.Lock()
+_EMB_DEADLINE = float(os.environ.get("EMBED_DEADLINE") or 30)
+_EMB_HTTP_TIMEOUT = float(os.environ.get("EMBED_HTTP_TIMEOUT") or 15)
+_EMB_CIRCUIT_SECONDS = float(os.environ.get("EMBED_CIRCUIT_SECONDS") or 30)
+_EMB_FAIL = {"until": 0.0, "err": ""}
+
+
+def _emb_pool():
+    global _EMB_POOL
+    with _EMB_POOL_LOCK:
+        if _EMB_POOL is None:
+            import concurrent.futures
+            workers = max(1, min(8, int(os.environ.get("EMBED_WORKERS", "4"))))
+            _EMB_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="emb")
+        return _EMB_POOL
+
+
+def _circuit_open():
+    return time.time() < _EMB_FAIL["until"]
+
+
+def _embed_one(t):
+    if _circuit_open():
+        raise RuntimeError("embedding 熔断中（%s 不可达：%s）" % (EMB_URL, _EMB_FAIL["err"]))
+    last = None
+    for attempt in range(3):
+        with _EMB_SEM:
+            try:
+                body = json.dumps({"model": EMB_MODEL, "input": (t or "")[:300]},
+                                  ensure_ascii=False).encode()
+                req = urllib.request.Request(EMB_URL, data=body,
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=_EMB_HTTP_TIMEOUT) as r:
+                    d = json.loads(r.read().decode())
+                v = (d.get("data") or [{}])[0].get("embedding") or []
+                if v:
+                    _EMB_FAIL.update({"until": 0.0, "err": ""})
+                    return v
+                last = RuntimeError("empty embedding")
+            except Exception as e:
+                last = e
+                if isinstance(e, (urllib.error.URLError, OSError, ConnectionError, socket.timeout)):
+                    # 端点不可达/超时：立刻熔断，别让每个请求线程各等满一轮重试
+                    _EMB_FAIL.update({"until": time.time() + _EMB_CIRCUIT_SECONDS,
+                                      "err": repr(e)})
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+    raise last
+
+
+def embed(texts, deadline=None):
+    """返回向量列表；超时抛 TimeoutError，端点不可达抛 RuntimeError（快速失败）。"""
+    texts = list(texts or [])
+    if not texts:
+        return []
+    if _circuit_open():
+        raise RuntimeError("embedding 熔断中（%s 不可达：%s）" % (EMB_URL, _EMB_FAIL["err"]))
     import concurrent.futures
-    import threading
-    workers = max(1, min(4, int(os.environ.get("EMBED_WORKERS", "4"))))
-    sem = _EMB_SEM
-
-    def one(t):
-        last = None
-        for attempt in range(3):
-            with sem:
-                try:
-                    body = json.dumps({"model": EMB_MODEL, "input": (t or "")[:300]},
-                                      ensure_ascii=False).encode()
-                    req = urllib.request.Request(EMB_URL, data=body,
-                                                 headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=60) as r:
-                        d = json.loads(r.read().decode())
-                    v = (d.get("data") or [{}])[0].get("embedding") or []
-                    if v:
-                        return v
-                    last = RuntimeError("empty embedding")
-                except Exception as e:
-                    last = e
-                    time.sleep(0.2 * (attempt + 1))
-        raise last
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        return list(ex.map(one, texts))
+    budget = float(deadline if deadline is not None else _EMB_DEADLINE)
+    pool = _emb_pool()
+    futs = [pool.submit(_embed_one, t) for t in texts]
+    _done, pending = concurrent.futures.wait(futs, timeout=budget)
+    if pending:
+        for f in pending:
+            f.cancel()
+        raise TimeoutError("embedding 超时：%d/%d 未完成（上限 %.0fs）"
+                           % (len(pending), len(futs), budget))
+    return [f.result() for f in futs]
 
 
 def cosine(a, b):
@@ -183,31 +244,35 @@ def cosine(a, b):
 
 
 def dense_search(docs, q, top=50, cache_path=""):
-    # 优先走 FAISS：HNSW 粗筛 + 候选精确 cosine；失败再回退旧缓存
+    """优先走 FAISS：HNSW 粗筛 + 候选精确 cosine；失败只做"缓存内打分"。
+
+    绝不在请求路径里整库 embed：旧实现会在 FAISS 不可用时把整库缺失向量补一遍，
+    8081 一挂，每个请求线程各扛一份整库文本 → 内存雪崩（2026-11-21）。
+    现在降级路径最多只 embed 查询本身，且必须已有磁盘向量缓存。
+    """
+    last_err = None
     try:
         import vector_store as VS
         return VS.search(docs, q, embed, top=max(50, int(top)))
-    except Exception:
-        pass
-    vecs = {}
-    if cache_path and os.path.isfile(cache_path):
-        try:
-            with open(cache_path, encoding="utf-8") as f:
-                vecs = json.load(f)
-        except Exception:
-            vecs = {}
-    missing = [d for d in docs if d["id"] not in vecs]
-    if missing:
-        got = embed([d["text"][:2000] for d in missing])
-        for d, v in zip(missing, got):
-            vecs[d["id"]] = v
-        if cache_path:
-            tmp = cache_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(vecs, f)
-            os.replace(tmp, cache_path)
-    qv = embed([q])[0]
-    scored = [(cosine(qv, vecs.get(d["id"])), i) for i, d in enumerate(docs)]
+    except Exception as e:
+        last_err = e
+    cache_path = cache_path or CACHE
+    if not (cache_path and os.path.isfile(cache_path)):
+        raise RuntimeError("向量检索不可用（%r），且没有可降级的向量缓存" % (last_err,))
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            vecs = json.load(f)
+    except Exception as e:
+        raise RuntimeError("向量缓存不可读（%r）" % (e,))
+    qv = embed([q])[0]                      # 只 embed 查询
+    scored = []
+    for i, d in enumerate(docs):
+        v = vecs.get(d["id"])
+        if not v:
+            continue
+        s = cosine(qv, v)
+        if s > 0:
+            scored.append((s, i))
     scored.sort(reverse=True)
     return scored[:top]
 
@@ -219,6 +284,51 @@ def rrf(lists, k=60):
         for rank, (_s, idx) in enumerate(lst):
             score[idx] = score.get(idx, 0.0) + 1.0 / (k + rank + 1)
     return sorted(score.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def tag_match(docs, q, top=50):
+    """实体/标签信号：query 词命中 core_tags 权重 2，标题 1，正文 0.5。
+
+    Mem0 的实体链接在 SQLite 里的最小版本：不建新表，直接用已有 tags。
+    """
+    import re
+    toks = [t.lower() for t in re.split(r"[\s,，。;；、/|]+", q or "") if len(t) >= 2]
+    if not toks:
+        return []
+    scored = []
+    for i, d in enumerate(docs):
+        tags = [str(t).lower() for t in (d.get("core_tags") or [])]
+        title = (d.get("title") or "").lower()
+        text = (d.get("text") or "").lower()
+        s = 0.0
+        for t in toks:
+            if any(t in tag for tag in tags):
+                s += 2.0
+            elif t in title:
+                s += 1.0
+            elif t in text:
+                s += 0.5
+        if s > 0:
+            scored.append((s, i))
+    scored.sort(reverse=True)
+    return scored[:top]
+
+
+def recency_factor(ts, boost=None, half_life_days=30.0):
+    """时间感知加权（Mem0 的 temporal ranking 最小版）：越新略加权，不改变硬过滤。"""
+    import math
+    import os
+    import time
+    if boost is None:
+        try:
+            boost = float(os.environ.get("MEM_RECENCY_BOOST", "0.1"))
+        except Exception:
+            boost = 0.1
+    if not ts or boost <= 0:
+        return 1.0
+    age = max(0.0, (time.time() - float(ts)) / 86400.0)
+    return 1.0 + boost * math.exp(-age / float(half_life_days))
+
 
 
 # ---------------- 挑（rerank） ----------------

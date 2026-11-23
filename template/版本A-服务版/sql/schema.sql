@@ -14,10 +14,16 @@ CREATE TABLE IF NOT EXISTS booku_memory_records (
     last_activated_at  REAL NOT NULL DEFAULT 0,
     activation_count   INTEGER NOT NULL DEFAULT 0,
     is_deleted         INTEGER NOT NULL DEFAULT 0,
+    is_archived        INTEGER NOT NULL DEFAULT 0,
+    deleted_at         REAL NOT NULL DEFAULT 0,
     origin             TEXT NOT NULL DEFAULT 'unknown',
     author             TEXT NOT NULL DEFAULT '',
     source_event       TEXT NOT NULL DEFAULT '',
-    version            INTEGER NOT NULL DEFAULT 1
+    version            INTEGER NOT NULL DEFAULT 1,
+    namespace          TEXT NOT NULL DEFAULT 'chat',
+    owner              TEXT NOT NULL DEFAULT '',
+    visibility         TEXT NOT NULL DEFAULT 'shared',
+    deletable          INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_mem_person     ON booku_memory_records (person_id);
@@ -62,23 +68,3 @@ CREATE TABLE IF NOT EXISTS turn_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_log_person_ts ON turn_logs (person, ts);
 CREATE INDEX IF NOT EXISTS idx_log_session  ON turn_logs (session_id);
-
--- 事件层：日志关闭后按类型合并，独立于原始日志
-CREATE TABLE IF NOT EXISTS event_records (
-    id             TEXT PRIMARY KEY,
-    person         TEXT,
-    start_ts       REAL,
-    end_ts         REAL,
-    summary        TEXT,
-    event_type     TEXT,
-    importance     REAL,
-    weight         REAL,
-    source_log_ids TEXT,
-    legacy         INTEGER NOT NULL DEFAULT 0,
-    is_archived    INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_event_person ON event_records (person, start_ts);
-CREATE INDEX IF NOT EXISTS idx_event_active ON event_records (is_archived);
-
--- 记忆分区：chat / game / voice / system
-ALTER TABLE booku_memory_records ADD COLUMN namespace TEXT NOT NULL DEFAULT 'chat';
