@@ -31,7 +31,7 @@ def _person(p, db=None):
     """写入前统一成 canonical person_id（qq:<uin> → user:qq:<uin>）。
 
     2026-11-19：turn_logs / event_records 之前直接落原始 person，
-    导致同一主人在库里有两套前缀；这里收口到 identity.canonical。
+    导致同一个人在库里有两套前缀；这里收口到 identity.canonical。
     """
     try:
         return IDENT.canonical(p, _db(db)) or S.canon_person(p)
@@ -223,9 +223,9 @@ def close_session(person, session_id, db=None):
             if log_id:
                 source_ids.append(str(log_id))
             if reply_text.strip():
-                parts.append("主人说：%s\n我说：%s" % (user_text, reply_text[:1000]))
+                parts.append("用户说：%s\n助手说：%s" % (user_text, reply_text[:1000]))
             else:
-                parts.append("主人说：%s" % user_text)
+                parts.append("用户说：%s" % user_text)
         content = " / ".join(parts)                      # 全文，不裸截断
         eid = "ev-" + uuid.uuid4().hex
         summary, full_path = soft_truncate(content, eid, db=db)   # B：软截断+全文另存
@@ -250,7 +250,8 @@ def close_session(person, session_id, db=None):
             "kinds": sorted(groups), "turns": len(rows), "merged": False}
 
 
-def append(person, user_text, reply_text="", ts=None, db=None, namespace="chat", boundary=""):
+def append(person, user_text, reply_text="", ts=None, db=None, namespace="chat", boundary="",
+           site=""):
     """追加一条日志并按 namespace 分策略切事件：
 
     · chat / game：同一 person 相邻回合 gap>=1800s 或窗口累计>=1800s → 关事件开新事件（不做合并）
@@ -289,9 +290,10 @@ def append(person, user_text, reply_text="", ts=None, db=None, namespace="chat",
             session_id = same
     else:
         session_id = "s%d" % int(ts)
-    con.execute("INSERT INTO turn_logs (person,ts,user_text,reply_text,session_id,namespace) "
-                "VALUES (?,?,?,?,?,?)",
-                (person, ts, user_text or "", reply_text or "", session_id, ns))
+    con.execute("INSERT INTO turn_logs (person,ts,user_text,reply_text,session_id,namespace,site) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (person, ts, user_text or "", reply_text or "", session_id, ns,
+                 str(site or "").strip().lower()[:16]))
     con.commit()
     con.close()
     if boundary in ("completed", "canceled", "game_end"):

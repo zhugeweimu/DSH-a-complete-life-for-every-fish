@@ -45,6 +45,7 @@ import graph_server as G                # noqa: E402
 import store as ST
 import consolidate as CO
 import distill as DL                    # noqa: E402
+import catalog as CAT                   # noqa: E402
 
 _default_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "metadata.db")
 _alt_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "mu-memory", "data", "booku_memory", "metadata.db")
@@ -453,7 +454,7 @@ def _clean_turn(text):
     return "\n".join(out).strip()
 
 
-def turns(person="", limit=20):
+def turns(person="", limit=20, site=""):
     """本地 turn_logs → 正序 user/assistant 轮次（limit 上限 20）。
 
     返回 {"person","limit","turns":[{"role","text","ts","session_id"}]}；无记录返回空列表。
@@ -469,7 +470,7 @@ def turns(person="", limit=20):
     con = sqlite3.connect(MEM_DB, timeout=10)
     con.row_factory = sqlite3.Row
     try:
-        # 别名跨通道：工作台的 dashboard 账号归到主人 QQ（旧库可能没有该表，容忍）
+        # 别名跨通道：工作台的 dashboard 账号归到使用者账号（旧库可能没有该表，容忍）
         try:
             for c in list(cands):
                 row = con.execute(
@@ -481,10 +482,13 @@ def turns(person="", limit=20):
                             cands.append(v)
         except sqlite3.OperationalError:
             pass
-        q = ("SELECT id,ts,user_text,reply_text,session_id FROM turn_logs "
-             "WHERE person IN (%s) ORDER BY ts DESC, id DESC LIMIT ?"
+        _site = str(site or "").strip().lower()
+        q = ("SELECT id,ts,user_text,reply_text,session_id,COALESCE(site,'') AS site "
+             "FROM turn_logs WHERE person IN (%s)"
+             " AND (?='' OR COALESCE(site,'')=?)"
+             " ORDER BY ts DESC, id DESC LIMIT ?"
              % ",".join("?" for _ in cands)) if cands else ""
-        rows = con.execute(q, cands + [limit]).fetchall() if cands else []
+        rows = con.execute(q, cands + [_site, _site, limit]).fetchall() if cands else []
     finally:
         con.close()
     out = []
@@ -494,14 +498,14 @@ def turns(person="", limit=20):
             if not txt:
                 continue
             item = {"role": role, "text": txt, "ts": r["ts"] or 0,
-                    "session_id": r["session_id"] or ""}
+                    "session_id": r["session_id"] or "", "site": r["site"] or ""}
             if out and out[-1]["role"] == role:
                 out[-1] = item          # 连续同角色：保留最新一条，保证交替
             else:
                 out.append(item)
     while out and out[0]["role"] != "user":
         out.pop(0)
-    return {"person": p, "limit": limit, "turns": out}
+    return {"person": p, "limit": limit, "site": str(site or "").strip().lower(), "turns": out}
 
 
 def booku_list(limit=200, offset=0, person="", folder=""):
@@ -871,6 +875,27 @@ class H2(BaseHTTPRequestHandler):
                     "view": ["chat", "game", ""],
                     "private_enabled": bool(_private_token()),
                 })
+            if self.path.startswith("/blocks"):
+                # 块层检索（直读 blocks.db，不依赖 blockd 8099）。
+                # 用途：注入端要「做过的事」时按语义取几条，块不再是只写不读。
+                import blocks_direct as BD
+                from urllib.parse import parse_qs, urlparse
+                qs = parse_qs(urlparse(self.path).query)
+                q = (qs.get("q") or [""])[0]
+                agent = (qs.get("agent") or ["mumu"])[0]
+                try:
+                    limit = max(1, min(10, int((qs.get("limit") or ["3"])[0])))
+                except ValueError:
+                    limit = 3
+                hits = BD.search(q, top=limit, agent=agent) if q.strip() else []
+                return self._send(200, {
+                    "q": q, "agent": agent, "db": BD.BLOCKS_DB,
+                    "items": [{"id": r.get("id"), "title": r.get("title"),
+                               "one_line": BD._one_line(r.get("summary")),
+                               "score": round(s, 3), "state": r.get("state"),
+                               "project": r.get("project"),
+                               "end_ts": r.get("end_ts")} for s, r in hits],
+                })
             if self.path.startswith("/health"):
                 con = G._conn()
                 n = lambda t: con.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
@@ -893,6 +918,10 @@ class H2(BaseHTTPRequestHandler):
                                 "last_error": H._EMB_FAIL["err"] or ""}
                 out["inflight_max"] = _MAX_INFLIGHT
                 out["threads"] = threading.active_count()
+                try:
+                    out["catalog"] = CAT.counts(MEM_DB)
+                except Exception as e:
+                    out["catalog"] = {"error": repr(e)}
                 return self._send(200, out)
             if self.path.startswith("/booku-memory/api/search"):
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -907,10 +936,37 @@ class H2(BaseHTTPRequestHandler):
                                                   int(p.get("offset") or 0),
                                                   p.get("person_id") or p.get("person") or "",
                                                   p.get("folder_id") or ""))
+            if self.path.startswith("/catalog"):
+                u = urllib.parse.urlparse(self.path)
+                path = u.path.rstrip("/")
+                p = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+                if path == "/catalog":
+                    who = (p.get("person") or "").strip()
+                    try:
+                        lim = max(1, min(200, int(p.get("limit") or 20)))
+                        nline = max(1, min(6, int(p.get("n") or 3)))
+                        bchars = max(80, min(1200, int(p.get("max_chars") or 400)))
+                    except ValueError:
+                        lim, nline, bchars = 20, 3, 400
+                    items = CAT.list_items(
+                        MEM_DB, person=_canon_person(who) if who else "",
+                        limit=lim, kind=(p.get("kind") or "").strip(),
+                        q=(p.get("q") or "").strip())
+                    out = {"items": items, "total": len(items)}
+                    if str(p.get("brief") or "") in ("1", "true", "yes"):
+                        out["text"] = CAT.brief(items, n=nline, max_chars=bchars)
+                    return self._send(200, out)
+                cid = urllib.parse.unquote(path[len("/catalog/"):]).strip()
+                want_full = str(p.get("full") or "") in ("1", "true", "yes")
+                d = CAT.detail(MEM_DB, cid, want_full)
+                if not d:
+                    return self._send(404, {"error": "not found", "id": cid})
+                return self._send(200, d)
             if self.path.startswith("/turns"):
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 p = {k: v[0] for k, v in qs.items()}
-                return self._send(200, turns(p.get("person") or "", p.get("limit") or 20))
+                return self._send(200, turns(p.get("person") or "", p.get("limit") or 20,
+                                              p.get("site") or ""))
             if self.path.startswith("/list"):
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 params = {k: v[0] for k, v in qs.items()}
@@ -973,7 +1029,7 @@ class H2(BaseHTTPRequestHandler):
             if self.path.startswith("/log"):
                 import turnlog as TL
                 r = TL.append(d.get("person") or "", d.get("user") or "", d.get("reply") or "",
-                              d.get("ts"), db=MEM_DB)
+                              d.get("ts"), db=MEM_DB, site=d.get("site") or "")
                 auto = {"enabled": False, "stored": []}
                 if os.environ.get("MEM_AUTOCAPTURE", "1") != "0":
                     import autocapture as AC

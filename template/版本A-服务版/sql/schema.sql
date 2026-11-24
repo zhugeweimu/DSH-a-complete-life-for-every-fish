@@ -56,6 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_memo_expires ON booku_temporary_memos (expires_at
 
 
 -- 日志层：每回合原样追加（事件由会话关闭时生成）
+-- site: 'dsh' | 'qq' | '' (老数据按 session_id 前缀回填)
 CREATE TABLE IF NOT EXISTS turn_logs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     person     TEXT NOT NULL DEFAULT '',
@@ -64,7 +65,9 @@ CREATE TABLE IF NOT EXISTS turn_logs (
     reply_text TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
     closed     INTEGER NOT NULL DEFAULT 0,
-    event_id   TEXT NOT NULL DEFAULT ''
+    event_id   TEXT NOT NULL DEFAULT '',
+    namespace  TEXT NOT NULL DEFAULT 'chat',
+    site       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_log_person_ts ON turn_logs (person, ts);
 CREATE INDEX IF NOT EXISTS idx_log_session  ON turn_logs (session_id);

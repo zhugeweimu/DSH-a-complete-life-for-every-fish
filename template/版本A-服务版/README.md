@@ -123,6 +123,21 @@ cp identity.example.json data/identity.json
 | POST | `/why` | 解释某条关系/事件的证据 |
 | GET | `/relations?entity=` | 查关系 |
 | GET | `/profile?person_id=` | 人物档案（印象/特征） |
+| GET | `/catalog?person=&limit=&n=&q=&max_chars=&brief=` | 目录层：最近有哪些事，每条只给标题 + 一句话 |
+| GET | `/catalog/<id>?full=1` | 点开一条目录：细节行；`full=1` 给整段原文 |
+| GET | `/blocks?q=&limit=&agent=` | 块层直读（不走 blockd 服务，只读 blocks.db） |
+| GET | `/turns?person=&limit=&site=` | 最近几轮原话，可按 `site` 分来源（如 dsh / qq） |
+
+### 三层下钻（catalog → detail → 原文）
+
+检索不是一次给全文，而是三层：
+
+1. **目录**（`/catalog`）—— 只给「有哪些事」，标题 + 一句话，几十条也就几百字。
+2. **点开**（`/catalog/<id>`）—— 给这条事的细节行，一条一句。
+3. **原文**（`/catalog/<id>?full=1`）—— 整段原文。
+
+设计原因：全量塞进上下文等于每轮付一次全量的钱，而绝大多数轮次用不到。
+目录不进 system prompt，是给模型按需调的工具；只有真正相关的那两三条才值得常驻。
 
 ## 自述与日记（最初版）
 

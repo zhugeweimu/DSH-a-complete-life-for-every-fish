@@ -43,6 +43,18 @@ async function post(base, path, body, timeoutMs = 8000) {
   }
 }
 
+async function get(base, path, timeoutMs = 8000) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await fetch(base + path, { signal: ctrl.signal })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    return await res.json()
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 function failText(e) {
   return '记忆内核连不上（' + String(e?.message || e).slice(0, 120) + '），这次不编。'
 }
@@ -199,6 +211,83 @@ export function apply(ctx, config = {}) {
             max_chars: Number(args.max_chars || 1200),
           })
           return { ok: true, text: data?.text || '没有可用的记忆。' }
+        } catch (e) {
+          return { ok: false, text: failText(e) }
+        }
+      },
+    },
+    {
+      name: 'memory_catalog',
+      description:
+        '看记忆库里「有哪些事」——只给标题和一句话，不给正文。先看目录，挑中哪条再用 memory_open 展开。'
+        + '想不起细节、不确定有没有这回事的时候，从这儿进；它比 memory_recall 轻，不占正文。',
+      parameters: {
+        type: 'object',
+        properties: {
+          q: { type: 'string', description: '关键词（可选）：给词就只看相关的那几件' },
+          n: { type: 'number', description: '给几条，默认 8' },
+          person: { type: 'string', description: '按人物过滤（可选）' },
+        },
+        required: [],
+      },
+      output: { schema: outSchema, render },
+      async execute(args = {}) {
+        try {
+          const p = new URLSearchParams({
+            n: String(Number(args.n || 8)),
+            limit: '20',
+            max_chars: '1200',
+            brief: '1',
+          })
+          const person = personOf(config, args)
+          if (person) p.set('person', person)
+          if (args.q) p.set('q', String(args.q))
+          const data = await get(base, '/catalog?' + p.toString())
+          const items = Array.isArray(data?.items) ? data.items : []
+          if (full) {
+            const body = items.map((it, i) => `--- ${i + 1} ---\\n${String(it?.text || it?.one_line || '').trim()}`).join('\\n')
+            return { ok: true, text: head + '\\n' + body.slice(0, 12000) }
+          }
+          if (!items.length) return { ok: true, text: '目录里没有对得上的事。' }
+          const head = data?.total ? `目录（共 ${data.total} 条，给前 ${items.length} 条）：` : '目录：'
+          const lines = items.map((it, i) => {
+            const day = it?.day || ''
+            const one = String(it?.one_line || '').slice(0, 60)
+            return `[${i + 1}] ${day ? day + ' ' : ''}${it?.title || it?.id || ''}${one ? ' — ' + one : ''}  (id=${it?.id || ''})`
+          })
+          return { ok: true, text: head + '\n' + lines.join('\n') + '\n\n要展开哪条，用 memory_open 传它的 id。' }
+        } catch (e) {
+          return { ok: false, text: failText(e) }
+        }
+      },
+    },
+    {
+      name: 'memory_open',
+      description: '展开目录里的一条（拿 memory_catalog 给的 id），看那件事当时到底发生了什么。',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: '目录里的 id，例如 ev-xxxx 或 k_0017' },
+          limit: { type: 'number', description: '最多给几行细节，默认 12' },
+        },
+        required: ['id'],
+      },
+      output: { schema: outSchema, render },
+      async execute(args = {}) {
+        try {
+          const id = String(args.id || '').trim()
+          const full = !!args.full
+          if (!id) return { ok: false, text: '得给 id。' }
+          const data = await get(base, '/catalog/' + encodeURIComponent(id) + (full ? '?full=1' : ''))
+          if (!data || !data.id) return { ok: true, text: '没找到这一条：' + id }
+          const n = Math.max(1, Math.min(40, Number(args.limit || 12)))
+          const items = Array.isArray(data.items) ? data.items.slice(0, n) : []
+          const head = `【${data.title || id}】${data.kind === 'block' ? '（块）' : ''}`
+          if (!items.length) return { ok: true, text: head + '\n（这条没有细节行）' }
+          return {
+            ok: true,
+            text: head + '\n' + items.map((it, i) => `${i + 1}. ${String(it?.one_line || '').slice(0, 90)}`).join('\n'),
+          }
         } catch (e) {
           return { ok: false, text: failText(e) }
         }
